@@ -1,0 +1,92 @@
+# Copy this file to config.yaml and adjust the hosts to match your ~/.ssh/config.
+default_cluster: killarney
+
+# Use ["ssh"] when this server runs in Linux, macOS, or WSL.
+# If the server runs under Windows Python but your SSH master session lives in WSL,
+# use ["wsl", "ssh"] instead.
+ssh_command:
+  - ssh
+
+# Local JSONL audit log for remote actions. Set to null to disable.
+audit_log: .slurm-mcp-audit.jsonl
+
+cluster_defaults:
+  docs:
+    - docs/alliance-canada.md
+  policies:
+    allow_conda: false
+    allow_docker: false
+    require_modules: true
+    python_env: virtualenv
+    no_heavy_login_node_commands: true
+  setup_hints:
+    python_virtualenv:
+      - module load python
+      - python -m venv $VENV_PATH
+      - source $VENV_PATH/bin/activate
+      - python -m pip install --upgrade pip
+      - python -m pip install -r requirements.txt
+    job_script:
+      - load required modules inside the Slurm script
+      - activate the project virtualenv inside the Slurm script
+      - write logs and checkpoints under scratch or project storage
+  slurm:
+    submit_command: sbatch
+    status_command: squeue
+    accounting_command: sacct
+    # Supported values: gres, gpus, gpus_per_node.
+    gpu_request_style: gres
+  storage:
+    preferred_work_root: scratch
+
+clusters:
+  killarney:
+    host: killarney
+    user: your_cc_username
+    docs:
+      - https://docs.alliancecan.ca/wiki/Killarney
+    storage:
+      remote_repo: /scratch/your_cc_username/my-paper
+      run_root: /scratch/your_cc_username/my-paper/runs
+
+  narval:
+    host: narval
+    user: your_cc_username
+    docs:
+      - https://docs.alliancecan.ca/wiki/Narval
+    storage:
+      remote_repo: /scratch/your_cc_username/my-paper
+      run_root: /scratch/your_cc_username/my-paper/runs
+
+  trillium:
+    host: trillium
+    user: your_cc_username
+    docs:
+      - https://docs.alliancecan.ca/wiki/Trillium
+    storage:
+      remote_repo: /scratch/your_cc_username/my-paper
+      run_root: /scratch/your_cc_username/my-paper/runs
+
+  vulcan:
+    host: vulcan
+    user: your_cc_username
+    docs:
+      - https://docs.alliancecan.ca/wiki/Vulcan
+    storage:
+      remote_repo: /scratch/your_cc_username/my-paper
+      run_root: /scratch/your_cc_username/my-paper/runs
+
+profiles:
+  debug_gpu:
+    description: Short interactive-scale GPU smoke test.
+    time: "00:30:00"
+    gpus: 1
+    cpus_per_task: 4
+    mem: 32G
+
+  train_gpu:
+    description: Standard single-GPU training run.
+    time: "12:00:00"
+    gpus: 1
+    cpus_per_task: 8
+    mem: 64G

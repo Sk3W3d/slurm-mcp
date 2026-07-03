@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alliance-slurm-mcp"
+version = "0.1.0"
+description = "Local MCP bridge for safe read-only Slurm access on Alliance Canada clusters."
+requires-python = ">=3.10"
+dependencies = [
+  "mcp>=1.2.0",
+  "PyYAML>=6.0",
+]
+
+[project.scripts]
+alliance-slurm-mcp = "slurm_mcp.server:main"
+
+[tool.setuptools.packages.find]
+include = ["slurm_mcp*"]
