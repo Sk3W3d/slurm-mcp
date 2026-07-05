@@ -28,6 +28,14 @@ from .remote_files import (
     validate_max_bytes,
     validate_max_depth,
 )
+from .remote_git import (
+    git_branch_argv,
+    git_fetch_dry_run_argv,
+    git_pull_argv,
+    git_rev_argv,
+    git_status_argv,
+    parse_git_status,
+)
 from .slurm import (
     build_sbatch_argv,
     parse_sacct,
@@ -503,6 +511,321 @@ def tail_job_log(
     }
 
 
+@mcp.tool()
+def cluster_preflight(cluster: str | None = None, write_check: bool = False) -> dict[str, object]:
+    """Check whether a configured cluster/project is ready for agent workflows."""
+    current_settings = get_settings()
+    target = current_settings.get_cluster(cluster)
+    checks: list[dict[str, object]] = []
+
+    auth_result = check_master(current_settings.ssh_command, target.host)
+    auth_ok = auth_result.returncode == 0
+    checks.append(
+        {
+            "name": "ssh_master_connection",
+            "ok": auth_ok,
+            "required": True,
+            "returncode": auth_result.returncode,
+            "message": (auth_result.stderr or auth_result.stdout).strip(),
+        }
+    )
+
+    info = current_settings.cluster_info(target.name)
+    storage = info.get("storage", {})
+    roots: dict[str, str] = {}
+    storage_ok = False
+    try:
+        if not isinstance(storage, dict):
+            raise ValueError("Cluster storage configuration must be a mapping.")
+        roots = allowed_roots_from_storage(storage)
+        storage_ok = True
+        checks.append(
+            {
+                "name": "storage_config",
+                "ok": True,
+                "required": True,
+                "roots": roots,
+            }
+        )
+    except ValueError as exc:
+        checks.append(
+            {
+                "name": "storage_config",
+                "ok": False,
+                "required": True,
+                "error": str(exc),
+            }
+        )
+
+    slurm_info = info.get("slurm", {})
+    if not isinstance(slurm_info, dict):
+        slurm_info = {}
+    checks.append(_profile_validation_check(current_settings, slurm_info, roots.get("run_root")))
+
+    if not auth_ok:
+        checks.append(
+            {
+                "name": "remote_checks",
+                "ok": False,
+                "required": True,
+                "skipped": True,
+                "error": "SSH master connection is not available.",
+            }
+        )
+        return _preflight_response(target, write_check, checks)
+
+    user_check = _preflight_remote_check(
+        current_settings,
+        target,
+        "remote_user",
+        ["whoami"],
+        required=True,
+        timeout=15,
+    )
+    if user_check["ok"] and target.user:
+        actual_user = str(user_check.get("stdout", "")).strip()
+        user_check["expected_user"] = target.user
+        user_check["actual_user"] = actual_user
+        user_check["ok"] = actual_user == target.user
+        if not user_check["ok"]:
+            user_check["error"] = "Remote user does not match configured user."
+    checks.append(user_check)
+
+    for tool_name in ("squeue", "sacct", "sbatch", "find", "grep", "tail", "stat", "git"):
+        checks.append(
+            _preflight_remote_check(
+                current_settings,
+                target,
+                f"tool:{tool_name}",
+                ["bash", "-lc", f"command -v {tool_name}"],
+                required=True,
+                timeout=15,
+            )
+        )
+
+    if storage_ok:
+        for root_name, root in roots.items():
+            checks.append(
+                _preflight_remote_check(
+                    current_settings,
+                    target,
+                    f"storage_exists:{root_name}",
+                    ["test", "-d", root],
+                    required=True,
+                    timeout=15,
+                )
+            )
+
+        run_root = roots.get("run_root")
+        if run_root:
+            logs_dir = f"{run_root}/logs"
+            if write_check:
+                checks.append(
+                    _preflight_remote_check(
+                        current_settings,
+                        target,
+                        "logs_dir_create",
+                        ["mkdir", "-p", logs_dir],
+                        required=True,
+                        timeout=30,
+                    )
+                )
+                checks.append(
+                    _preflight_remote_check(
+                        current_settings,
+                        target,
+                        "logs_dir_writable",
+                        ["test", "-w", logs_dir],
+                        required=True,
+                        timeout=15,
+                    )
+                )
+            else:
+                checks.append(
+                    _preflight_remote_check(
+                        current_settings,
+                        target,
+                        "logs_dir_exists",
+                        ["test", "-d", logs_dir],
+                        required=False,
+                        timeout=15,
+                    )
+                )
+
+        remote_repo = roots.get("remote_repo")
+        if remote_repo:
+            git_result = _preflight_remote_check(
+                current_settings,
+                target,
+                "git_repo_status",
+                git_status_argv(remote_repo),
+                required=False,
+                timeout=30,
+            )
+            if git_result["ok"]:
+                git_result["status"] = parse_git_status(str(git_result.get("stdout", "")))
+            checks.append(git_result)
+
+    return _preflight_response(target, write_check, checks)
+
+
+@mcp.tool()
+def remote_git_status(cluster: str | None = None) -> dict[str, object]:
+    """Return structured Git status for the configured remote repository."""
+    current_settings = get_settings()
+    target, remote_repo = _repo_context(current_settings, cluster)
+    output = _run_remote_output(
+        current_settings,
+        target,
+        git_status_argv(remote_repo),
+        tool="remote_git_status",
+        timeout=30,
+        strip=False,
+    )
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "remote_repo": remote_repo,
+        "status": parse_git_status(output),
+    }
+
+
+@mcp.tool()
+def remote_git_rev(cluster: str | None = None) -> dict[str, object]:
+    """Return the current full and short Git commit for the configured remote repository."""
+    current_settings = get_settings()
+    target, remote_repo = _repo_context(current_settings, cluster)
+    full = _run_remote_output(
+        current_settings,
+        target,
+        git_rev_argv(remote_repo),
+        tool="remote_git_rev",
+        timeout=30,
+    )
+    short = _run_remote_output(
+        current_settings,
+        target,
+        git_rev_argv(remote_repo, short=True),
+        tool="remote_git_rev",
+        timeout=30,
+    )
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "remote_repo": remote_repo,
+        "commit": full,
+        "short_commit": short,
+    }
+
+
+@mcp.tool()
+def remote_git_branch(cluster: str | None = None) -> dict[str, object]:
+    """Return the current Git branch for the configured remote repository."""
+    current_settings = get_settings()
+    target, remote_repo = _repo_context(current_settings, cluster)
+    branch = _run_remote_output(
+        current_settings,
+        target,
+        git_branch_argv(remote_repo),
+        tool="remote_git_branch",
+        timeout=30,
+    )
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "remote_repo": remote_repo,
+        "branch": branch or None,
+        "detached": not bool(branch),
+    }
+
+
+@mcp.tool()
+def remote_git_pull(cluster: str | None = None, dry_run: bool = True) -> dict[str, object]:
+    """Dry-run or perform a fast-forward-only Git pull in the configured remote repository."""
+    current_settings = get_settings()
+    target, remote_repo = _repo_context(current_settings, cluster)
+    before_status_output = _run_remote_output(
+        current_settings,
+        target,
+        git_status_argv(remote_repo),
+        tool="remote_git_pull",
+        timeout=30,
+        strip=False,
+    )
+    before_status = parse_git_status(before_status_output)
+    before_rev = _run_remote_output(
+        current_settings,
+        target,
+        git_rev_argv(remote_repo),
+        tool="remote_git_pull",
+        timeout=30,
+    )
+
+    if dry_run:
+        result = _run_remote_result(
+            current_settings,
+            target,
+            git_fetch_dry_run_argv(remote_repo),
+            tool="remote_git_pull",
+            timeout=120,
+        )
+        return {
+            "cluster": target.name,
+            "host": target.host,
+            "remote_repo": remote_repo,
+            "dry_run": True,
+            "ok": result.returncode == 0,
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "before_commit": before_rev,
+            "before_status": before_status,
+        }
+
+    if not before_status["clean"]:
+        raise ValueError("Refusing to pull because the remote repository has uncommitted changes.")
+
+    pull_result = _run_remote_result(
+        current_settings,
+        target,
+        git_pull_argv(remote_repo),
+        tool="remote_git_pull",
+        timeout=120,
+    )
+    if pull_result.returncode != 0:
+        raise RuntimeError(pull_result.stderr.strip() or "remote git pull failed")
+
+    after_status_output = _run_remote_output(
+        current_settings,
+        target,
+        git_status_argv(remote_repo),
+        tool="remote_git_pull",
+        timeout=30,
+        strip=False,
+    )
+    after_rev = _run_remote_output(
+        current_settings,
+        target,
+        git_rev_argv(remote_repo),
+        tool="remote_git_pull",
+        timeout=30,
+    )
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "remote_repo": remote_repo,
+        "dry_run": False,
+        "ok": True,
+        "stdout": pull_result.stdout,
+        "stderr": pull_result.stderr,
+        "before_commit": before_rev,
+        "after_commit": after_rev,
+        "changed": before_rev != after_rev,
+        "before_status": before_status,
+        "after_status": parse_git_status(after_status_output),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Alliance Slurm MCP server")
     parser.add_argument(
@@ -548,6 +871,14 @@ def _file_context(settings: Settings, cluster: str | None) -> tuple[Cluster, dic
     if not isinstance(storage, dict):
         raise ValueError("Cluster storage configuration must be a mapping.")
     return target, allowed_roots_from_storage(storage)
+
+
+def _repo_context(settings: Settings, cluster: str | None) -> tuple[Cluster, str]:
+    target, roots = _file_context(settings, cluster)
+    remote_repo = roots.get("remote_repo")
+    if not remote_repo:
+        raise ValueError("Cluster must define storage.remote_repo before remote Git tools can be used.")
+    return target, remote_repo
 
 
 def _job_log_files(
@@ -635,6 +966,102 @@ def _write_remote_audit(settings: Settings, event: dict[str, Any]) -> None:
     except OSError:
         # Audit logging should never make a read/status command fail.
         pass
+
+
+def _preflight_response(
+    target: Cluster,
+    write_check: bool,
+    checks: list[dict[str, object]],
+) -> dict[str, object]:
+    required_failures = [check for check in checks if check.get("required") and not check.get("ok")]
+    warnings = [check for check in checks if not check.get("required") and not check.get("ok")]
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "write_check": write_check,
+        "ok": not required_failures,
+        "required_failures": len(required_failures),
+        "warnings": len(warnings),
+        "checks": checks,
+    }
+
+
+def _preflight_remote_check(
+    settings: Settings,
+    target: Cluster,
+    name: str,
+    argv: list[str],
+    *,
+    required: bool,
+    timeout: int,
+    cwd: str | None = None,
+) -> dict[str, object]:
+    try:
+        result = _run_remote_result(settings, target, argv, tool="cluster_preflight", timeout=timeout, cwd=cwd)
+    except Exception as exc:
+        return {
+            "name": name,
+            "ok": False,
+            "required": required,
+            "argv": argv,
+            "error": repr(exc),
+        }
+    return _preflight_result_check(name, result, required=required, argv=argv)
+
+
+def _preflight_result_check(
+    name: str,
+    result: CommandResult,
+    *,
+    required: bool,
+    argv: list[str],
+) -> dict[str, object]:
+    ok = result.returncode == 0
+    check: dict[str, object] = {
+        "name": name,
+        "ok": ok,
+        "required": required,
+        "argv": argv,
+        "returncode": result.returncode,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+    }
+    if not ok:
+        check["error"] = result.stderr.strip() or f"command failed with exit code {result.returncode}"
+    return check
+
+
+def _profile_validation_check(
+    settings: Settings,
+    slurm_info: dict[str, Any],
+    run_root: str | None,
+) -> dict[str, object]:
+    profiles = settings.profiles or {}
+    valid: list[str] = []
+    invalid: list[dict[str, str]] = []
+    log_dir = f"{run_root}/logs" if run_root else None
+
+    for profile_name, profile in profiles.items():
+        try:
+            if not isinstance(profile, dict):
+                raise ValueError("Job profile must be a mapping.")
+            build_sbatch_argv(
+                profile,
+                "preflight.slurm",
+                cluster_slurm=slurm_info,
+                log_dir=log_dir,
+            )
+            valid.append(profile_name)
+        except ValueError as exc:
+            invalid.append({"profile": profile_name, "error": str(exc)})
+
+    return {
+        "name": "job_profiles_valid",
+        "ok": not invalid,
+        "required": True,
+        "valid_profiles": valid,
+        "invalid_profiles": invalid,
+    }
 
 
 if __name__ == "__main__":

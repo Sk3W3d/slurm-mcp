@@ -110,6 +110,7 @@ and pass the same `--config config.yaml` argument.
 - `list_clusters()`
 - `cluster_info(cluster=None)`
 - `cluster_docs(cluster=None)`
+- `cluster_preflight(cluster=None, write_check=False)`
 - `cluster_auth_status(cluster=None)`
 - `remote_whoami(cluster=None)`
 - `list_job_profiles(cluster=None)`
@@ -122,8 +123,21 @@ and pass the same `--config config.yaml` argument.
 - `grep_files(pattern, path=None, cluster=None, limit=50, base="run_root")`
 - `job_logs(job_id, cluster=None, limit=20)`
 - `tail_job_log(job_id, stream="stdout", cluster=None, lines=100)`
+- `remote_git_status(cluster=None)`
+- `remote_git_rev(cluster=None)`
+- `remote_git_branch(cluster=None)`
+- `remote_git_pull(cluster=None, dry_run=True)`
 
 The server intentionally does not expose an arbitrary remote shell.
+
+## Preflight
+
+Run `cluster_preflight()` before asking an agent to submit work. It checks the
+SSH master connection, remote user, required command-line tools, configured
+storage roots, job profile validity, and remote Git status.
+
+By default, preflight is read-only. Use `write_check=True` to let it create and
+check writability of `storage.run_root/logs`.
 
 ## Job API shape
 
@@ -176,3 +190,13 @@ configured roots.
 Remote actions are logged locally as JSONL. By default, the log is written to
 `.slurm-mcp-audit.jsonl` next to the config file. Set `audit_log: null` in
 `config.yaml` to disable audit logging.
+
+## Remote Git
+
+Remote Git tools operate only inside `storage.remote_repo`.
+
+`remote_git_status`, `remote_git_rev`, and `remote_git_branch` are read-only.
+`remote_git_pull` defaults to `dry_run=True`, which runs `git fetch --dry-run
+--verbose`. To perform an actual update, call it with `dry_run=False`; the MCP
+will refuse to pull if the remote repository has uncommitted changes, and it
+uses `git pull --ff-only`.
