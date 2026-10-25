@@ -8,7 +8,9 @@ from typing import Any
 from .validators import validate_job_id, validate_remote_relative_path
 
 
-_REMOTE_ROOT_KEYS = ("remote_repo", "run_root")
+_REMOTE_ROOT_KEYS = ("remote_repo", "run_root", "venv_root", "hf_home")
+# Roots that agent workflows cannot run without; the others are optional extras.
+REQUIRED_ROOT_KEYS = ("remote_repo", "run_root")
 _GREP_PATTERN_MAX_CHARS = 500
 _FIND_FIELDS = ("modified_epoch", "size_bytes", "path")
 
@@ -30,7 +32,7 @@ def allowed_roots_from_storage(storage: dict[str, Any]) -> dict[str, str]:
         if not isinstance(value, str) or not value:
             raise ValueError(f"storage.{key} must be a non-empty string when set.")
         roots[key] = _normalize_absolute_remote_path(value, f"storage.{key}")
-    if not roots:
+    if not any(key in roots for key in REQUIRED_ROOT_KEYS):
         raise ValueError("Cluster must define storage.remote_repo or storage.run_root.")
     return roots
 
@@ -90,6 +92,22 @@ def validate_max_depth(max_depth: int, *, hard_limit: int = 10) -> int:
     if not isinstance(max_depth, int) or max_depth < 0 or max_depth > hard_limit:
         raise ValueError(f"max_depth must be an integer between 0 and {hard_limit}.")
     return max_depth
+
+
+def remote_parent(path: str) -> str:
+    parent = str(PurePosixPath(path).parent)
+    return parent
+
+
+def write_file_argv(path: str, *, executable: bool = False, overwrite: bool = False) -> list[str]:
+    """Write stdin to path, creating parent directories. Content arrives on stdin."""
+    script = 'mkdir -p -- "$(dirname -- "$1")"'
+    if not overwrite:
+        script += ' && if [ -e "$1" ]; then echo "Refusing to overwrite existing file: $1" >&2; exit 17; fi'
+    script += ' && cat > "$1"'
+    if executable:
+        script += ' && chmod +x -- "$1"'
+    return ["bash", "-c", script, "_", path]
 
 
 def validate_grep_pattern(pattern: str) -> str:

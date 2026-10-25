@@ -62,25 +62,32 @@ SACCT_FORMAT = ",".join(
     )
 )
 
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 _SUBMITTED_JOB_RE = re.compile(r"Submitted batch job (?P<job_id>[0-9]+(?:_[0-9]+)?)")
 
 _PROFILE_SBATCH_OPTIONS = {
     "account": "--account",
+    "array": "--array",
     "constraint": "--constraint",
     "cpus_per_task": "--cpus-per-task",
+    "dependency": "--dependency",
     "error": "--error",
+    "exclusive": "--exclusive",
     "mail_type": "--mail-type",
     "mail_user": "--mail-user",
     "mem": "--mem",
+    "mem_per_cpu": "--mem-per-cpu",
     "nodes": "--nodes",
     "ntasks": "--ntasks",
     "ntasks_per_node": "--ntasks-per-node",
     "output": "--output",
     "partition": "--partition",
     "qos": "--qos",
+    "signal": "--signal",
     "time": "--time",
 }
-_PROFILE_SPECIAL_KEYS = {"description", "gpus", "gpu_type", "gres", "sbatch_options"}
+# "env" is applied by the caller through build_sbatch_argv(env=...), not as an sbatch flag.
+_PROFILE_SPECIAL_KEYS = {"description", "env", "gpus", "gpu_type", "gres", "sbatch_options"}
 _VALID_GPU_REQUEST_STYLES = {"gres", "gpus", "gpus_per_node"}
 
 
@@ -118,6 +125,81 @@ def sacct_argv(job_id: str) -> list[str]:
     ]
 
 
+def sacct_user_argv(user: str, start: str) -> list[str]:
+    return [
+        "sacct",
+        "-u",
+        user,
+        "-X",
+        f"--starttime={start}",
+        f"--format={SACCT_FORMAT}",
+        "--parsable2",
+        "--noheader",
+    ]
+
+
+def scancel_argv(job_id: str, user: str) -> list[str]:
+    # --user makes scancel act only when the job belongs to this user.
+    return ["scancel", f"--user={user}", job_id]
+
+
+SSHARE_FIELDS = ("account", "user", "raw_shares", "norm_shares", "raw_usage", "effective_usage", "fair_share")
+
+
+def sshare_argv(user: str) -> list[str]:
+    return [
+        "sshare",
+        "-U",
+        "-u",
+        user,
+        "--noheader",
+        "--parsable2",
+        "--format=Account,User,RawShares,NormShares,RawUsage,EffectvUsage,FairShare",
+    ]
+
+
+def parse_sshare(output: str) -> list[dict[str, str]]:
+    return _parse_delimited_rows(output, SSHARE_FIELDS)
+
+
+def submit_accounts(sshare_rows: list[dict[str, str]]) -> list[str]:
+    """Return account names usable with --account (Alliance lists def-pi_cpu / def-pi_gpu)."""
+    accounts: list[str] = []
+    for row in sshare_rows:
+        name = row.get("account", "")
+        base = re.sub(r"_(cpu|gpu)$", "", name)
+        if base and base not in accounts:
+            accounts.append(base)
+    return accounts
+
+
+SINFO_FIELDS = ("partition", "availability", "time_limit", "nodes", "state", "cpus", "memory_mb", "gres")
+SINFO_FORMAT = "%P|%a|%l|%D|%t|%c|%m|%G"
+
+
+def sinfo_argv() -> list[str]:
+    return ["sinfo", "--noheader", f"--format={SINFO_FORMAT}"]
+
+
+def parse_sinfo(output: str) -> list[dict[str, str]]:
+    return _parse_delimited_rows(output, SINFO_FIELDS)
+
+
+def merge_job_options(
+    profile: dict[str, Any] | None,
+    overrides: dict[str, Any] | None,
+    default_account: str | None = None,
+) -> dict[str, Any]:
+    merged: dict[str, Any] = dict(profile or {})
+    for key, value in (overrides or {}).items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("Override keys must be non-empty strings.")
+        merged[key] = value
+    if default_account and not merged.get("account"):
+        merged["account"] = default_account
+    return merged
+
+
 def parse_squeue(output: str) -> list[dict[str, str]]:
     return _parse_delimited_rows(output, SQUEUE_FIELDS)
 
@@ -141,6 +223,7 @@ def build_sbatch_argv(
     script_args: list[str] | None = None,
     cluster_slurm: dict[str, Any] | None = None,
     log_dir: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> list[str]:
     if not isinstance(profile, dict):
         raise ValueError("Job profile must be a mapping.")
@@ -170,10 +253,37 @@ def build_sbatch_argv(
     if log_dir and "error" not in profile:
         argv.append(f"--error={log_dir}/%x-%j.err")
 
+    if env:
+        argv.append(export_env_option(env))
+
     argv.extend(_profile_sbatch_options(profile))
     argv.append(script)
     argv.extend(validate_argument_list(script_args, "script_args"))
     return argv
+
+
+def export_env_option(env: dict[str, str]) -> str:
+    """Build --export=ALL,NAME=value,... so the job keeps the login environment plus extras."""
+    parts = ["ALL"]
+    for name, value in env.items():
+        if not isinstance(name, str) or not _ENV_NAME_RE.fullmatch(name):
+            raise ValueError(f"Invalid environment variable name: {name!r}")
+        text = str(value)
+        if "," in text or "\x00" in text or "\n" in text or "\r" in text:
+            raise ValueError(f"Environment variable {name} cannot contain commas or control characters.")
+        parts.append(f"{name}={text}")
+    return "--export=" + ",".join(parts)
+
+
+def merge_env(*sources: dict[str, Any] | None) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    for source in sources:
+        for name, value in (source or {}).items():
+            if value is None:
+                merged.pop(name, None)
+            else:
+                merged[name] = str(value)
+    return merged
 
 
 def _parse_delimited_rows(output: str, fields: tuple[str, ...]) -> list[dict[str, str]]:

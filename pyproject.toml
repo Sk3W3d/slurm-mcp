@@ -4,16 +4,24 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alliance-slurm-mcp"
-version = "0.1.0"
-description = "Local MCP bridge for safe read-only Slurm access on Alliance Canada clusters."
+version = "0.2.0"
+description = "Local MCP bridge for guarded Slurm, Git, virtualenv, and Hugging Face workflows on Alliance Canada clusters."
 requires-python = ">=3.10"
 dependencies = [
-  "mcp>=1.2.0",
+  # mcp 2.x renamed FastMCP to MCPServer; this server targets the 1.x API.
+  "mcp>=1.2.0,<2",
+  "paramiko>=3.4",
   "PyYAML>=6.0",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
 
 [project.scripts]
 alliance-slurm-mcp = "slurm_mcp.server:main"
 
 [tool.setuptools.packages.find]
 include = ["slurm_mcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

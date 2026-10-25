@@ -1,14 +1,35 @@
 # Copy this file to config.yaml and adjust the hosts to match your ~/.ssh/config.
 default_cluster: killarney
 
-# Use ["ssh"] when this server runs in Linux, macOS, or WSL.
-# If the server runs under Windows Python but your SSH master session lives in WSL,
-# use ["wsl", "ssh"] instead.
+# How the server reaches the clusters:
+#   auto     - paramiko on Windows, openssh elsewhere (default)
+#   openssh  - reuse a 2FA-backed ControlMaster session you start with `ssh -MNf <host>`
+#              (Linux, macOS, WSL). Set ssh_command to ["wsl", "ssh"] if the master lives in WSL.
+#   paramiko - the server holds the connection itself; call the cluster_login tool and
+#              approve the Duo push on your phone. Works on native Windows.
+ssh_backend: auto
 ssh_command:
   - ssh
+# Optional overrides for the paramiko backend (defaults: ~/.ssh/config, ~/.ssh/known_hosts).
+# ssh_config: ~/.ssh/config
+# known_hosts: ~/.ssh/known_hosts
+# Answer sent to the Duo prompt when no passcode is given ("1" = push to first device).
+duo_option: "1"
+keepalive_seconds: 60
 
 # Local JSONL audit log for remote actions. Set to null to disable.
 audit_log: .slurm-mcp-audit.jsonl
+
+# Local directories that upload_file, download_file, and sync_local_commits may use.
+# Defaults to the server's working directory (normally your project).
+# local_roots:
+#   - D:/Projects/my-paper
+
+# Cap for upload_file, download_file, and git bundles.
+max_transfer_bytes: 200000000
+
+# Enables run_remote_command, an unrestricted login-node shell. Off by default.
+allow_remote_shell: false
 
 cluster_defaults:
   docs:
@@ -19,13 +40,22 @@ cluster_defaults:
     require_modules: true
     python_env: virtualenv
     no_heavy_login_node_commands: true
+    # Most Alliance clusters have no internet on compute nodes. When false, jobs get
+    # HF_HUB_OFFLINE=1 / TRANSFORMERS_OFFLINE=1 / HF_DATASETS_OFFLINE=1 alongside HF_HOME.
+    compute_node_internet: false
+  python:
+    # Lmod module that provides Python; extra modules are loaded after it.
+    module: python/3.11
+    modules: []
+    # Default virtualenv name under storage.venv_root.
+    venv_name: default
   setup_hints:
     python_virtualenv:
-      - module load python
-      - python -m venv $VENV_PATH
+      - module load python/3.11
+      - virtualenv --no-download $VENV_PATH
       - source $VENV_PATH/bin/activate
-      - python -m pip install --upgrade pip
-      - python -m pip install -r requirements.txt
+      - pip install --no-index --upgrade pip
+      - pip install --no-index -r requirements.txt
     job_script:
       - load required modules inside the Slurm script
       - activate the project virtualenv inside the Slurm script
@@ -36,6 +66,11 @@ cluster_defaults:
     accounting_command: sacct
     # Supported values: gres, gpus, gpus_per_node.
     gpu_request_style: gres
+    # Added as --account when a profile does not set one. See the slurm_accounts tool.
+    # default_account: def-yourpi
+    # Extra environment variables for every job (passed with --export=ALL,...).
+    # job_env:
+    #   OMP_NUM_THREADS: "1"
   storage:
     preferred_work_root: scratch
 
@@ -48,6 +83,11 @@ clusters:
     storage:
       remote_repo: /scratch/your_cc_username/my-paper
       run_root: /scratch/your_cc_username/my-paper/runs
+      # Virtualenvs hold many small files; keep them out of scratch (purged) and
+      # watch the file-count quota wherever you put them.
+      venv_root: /home/your_cc_username/venvs
+      # Shared Hugging Face cache, read by jobs through HF_HOME.
+      hf_home: /project/def-yourpi/your_cc_username/hf
 
   narval:
     host: narval
@@ -57,6 +97,8 @@ clusters:
     storage:
       remote_repo: /scratch/your_cc_username/my-paper
       run_root: /scratch/your_cc_username/my-paper/runs
+      venv_root: /home/your_cc_username/venvs
+      hf_home: /project/def-yourpi/your_cc_username/hf
 
   trillium:
     host: trillium
@@ -66,6 +108,8 @@ clusters:
     storage:
       remote_repo: /scratch/your_cc_username/my-paper
       run_root: /scratch/your_cc_username/my-paper/runs
+      venv_root: /home/your_cc_username/venvs
+      hf_home: /project/def-yourpi/your_cc_username/hf
 
   vulcan:
     host: vulcan
@@ -75,6 +119,8 @@ clusters:
     storage:
       remote_repo: /scratch/your_cc_username/my-paper
       run_root: /scratch/your_cc_username/my-paper/runs
+      venv_root: /home/your_cc_username/venvs
+      hf_home: /project/def-yourpi/your_cc_username/hf
 
 profiles:
   debug_gpu:
@@ -90,3 +136,6 @@ profiles:
     gpus: 1
     cpus_per_task: 8
     mem: 64G
+    # Per-profile job environment, merged after cluster job_env.
+    # env:
+    #   TOKENIZERS_PARALLELISM: "false"

@@ -1,202 +1,176 @@
 # Alliance Slurm MCP
 
-Local MCP bridge for safe, narrow access to Alliance Canada Slurm clusters.
+A local MCP server that lets Claude Code (or another MCP client) work on
+Alliance Canada clusters: connect through your 2FA-protected SSH login,
+sync code, build virtualenvs, cache Hugging Face models for offline
+compute nodes, submit and cancel Slurm jobs, and read results.
 
-This first version is intentionally read-only. It checks whether an existing
-2FA-backed SSH control connection can be reused, then exposes harmless Slurm
-queries such as `squeue` and `sacct`.
+It does not expose a general remote shell by default. Each tool runs a
+fixed, validated command, file access is limited to the directories you
+configure, and every remote action is written to a local audit log.
 
-## 1. Configure SSH multiplexing
+## 1. SSH access
 
-Add entries like this to `~/.ssh/config`:
+Every cluster needs a `Host` entry in `~/.ssh/config`, and your public key
+must be registered in CCDB
+(<https://ccdb.alliancecan.ca/ssh_authorized_keys>):
 
 ```sshconfig
-Host killarney
-  HostName killarney.alliancecan.ca
+Host narval
+  HostName narval.alliancecan.ca
   User your_cc_username
-  ControlMaster auto
-  ControlPath ~/.ssh/cm-%C
-  ControlPersist 8h
-  ServerAliveInterval 60
-  ServerAliveCountMax 3
-  ForwardAgent no
 ```
 
-Repeat for `narval`, `trillium`, and `vulcan` as needed, using the host names
-recommended by Alliance documentation or your institute.
+Connect once from a terminal (`ssh narval`) so the host key lands in
+`~/.ssh/known_hosts`. The server refuses hosts it cannot verify.
 
-On Windows, native OpenSSH may not support `ControlMaster`/`ControlPersist`
-reliably. The most robust setup is to run the master SSH session in WSL. If the
-MCP server itself runs under Windows Python, set this in `config.yaml`:
+The server has two ways to reuse your Duo-approved login (`ssh_backend` in
+`config.yaml`):
 
-```yaml
-ssh_command:
-  - wsl
-  - ssh
-```
+- **paramiko** (default on Windows). The server holds the SSH connection
+  itself. Claude calls `cluster_login`, you approve the Duo push on your
+  phone, and later calls reuse that connection until the server stops. Keys
+  are taken from ssh-agent or from `~/.ssh/id_*`. Encrypted keys must be
+  loaded into the agent.
+- **openssh** (default on Linux, macOS and WSL). Reuses an OpenSSH
+  ControlMaster session that you start yourself:
 
-If the MCP server runs inside WSL too, leave `ssh_command` as:
+  ```sshconfig
+  Host narval
+    HostName narval.alliancecan.ca
+    User your_cc_username
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 8h
+  ```
 
-```yaml
-ssh_command:
-  - ssh
-```
+  Then run `ssh -MNf narval`, approve Duo, and check it with `ssh -O check narval`.
 
-## 2. Start a 2FA-backed master SSH session
-
-Run this manually in a terminal:
+## 2. Install and configure
 
 ```bash
-ssh -MNf killarney
+python -m pip install -e ".[dev]"
+cp config.example.yaml config.yaml   # then edit it
 ```
 
-You should receive the usual 2FA prompt. After approval, SSH stays open in the
-background as a master connection.
+For each cluster, `config.yaml` sets the following under `storage`:
 
-Check it with:
+| key | used for |
+|---|---|
+| `remote_repo` | your code on the cluster (Git tools, job scripts, `submit_job` working directory) |
+| `run_root` | logs (`run_root/logs`), outputs, and background task folders (`run_root/mcp-tasks`) |
+| `venv_root` | virtualenvs made by `setup_venv` |
+| `hf_home` | shared Hugging Face cache that jobs read through `HF_HOME` |
+
+Values in `cluster_defaults` apply to every cluster, and each cluster can
+override them. `python.module` picks the Lmod Python module (for example
+`python/3.11`). `slurm.default_account` fills in `--account`.
+`policies.compute_node_internet: false` makes jobs run with the Hugging Face
+offline flags.
+
+## 3. Register with Claude Code
 
 ```bash
-ssh -O check killarney
+claude mcp add alliance-slurm --scope user \
+  -- D:/Projects/slurm-mcp/.venv/Scripts/alliance-slurm-mcp.exe \
+  --config D:/Projects/slurm-mcp/config.yaml
 ```
 
-Then verify non-interactive reuse:
+Add `-e HF_TOKEN=hf_...` if you will need gated models (see `hf_store_token`).
+Local file tools (`upload_file`, `download_file`, `sync_local_commits`) may
+only touch paths under `local_roots`. When `local_roots` is not set, that is
+the directory Claude Code was started in.
 
-```bash
-ssh -o BatchMode=yes killarney whoami
-ssh -o BatchMode=yes killarney squeue -u your_cc_username
-```
+## Typical workflow
 
-If those commands work without a new 2FA prompt, the MCP server should be able
-to reuse the session.
+1. `cluster_login(cluster="narval")`: approve the Duo push. Then run
+   `cluster_preflight()`.
+2. Get code onto the cluster. Use `remote_git_clone(url)` the first time.
+   After that, use `remote_git_pull(dry_run=False)` to pick up changes pushed
+   to GitHub, or `sync_local_commits()` to send local commits that aren't
+   pushed.
+3. `setup_venv(requirements="requirements.txt")` starts a background task.
+   Poll it with `remote_task_status(task_id)`.
+4. `hf_download("meta-llama/Llama-3.1-8B-Instruct")` starts a background
+   task that downloads on the login node into `hf_home`.
+5. `job_script_template(command="python train.py")` drafts a script. Save it
+   with `write_file("scripts/train.sh", ...)`.
+6. `submit_job("train_gpu", "scripts/train.sh", overrides={"time": "04:00:00"})`
+   submits the job. Add `dry_run=True` first to preview the `sbatch` command.
+7. Check on the job with `job_status`, `tail_job_log`, `list_run_files`,
+   `read_file`, `grep_files`, and `download_file`.
 
-## 3. Configure this MCP server
+## Tools
 
-Copy the example config:
+**Connection and cluster info:** `cluster_login`, `cluster_logout`,
+`cluster_auth_status`, `cluster_preflight`, `remote_whoami`, `list_clusters`,
+`cluster_info`, `cluster_docs`, `cluster_partitions`, `slurm_accounts`.
 
-```bash
-cp config.example.yaml config.yaml
-```
+**Jobs:** `list_job_profiles`, `submit_job`, `cancel_job` (your own jobs only),
+`list_jobs`, `job_status`, `job_history`, `job_logs`, `tail_job_log`,
+`job_script_template`.
 
-Edit `config.yaml` so each cluster `host` matches an SSH `Host` entry.
+**Files:** `list_run_files`, `read_file`, `tail_file`, `grep_files`,
+`write_file`, `upload_file`, `download_file`. Paths must stay inside the
+configured storage roots. Local paths must stay inside `local_roots`.
+Transfers are capped at `max_transfer_bytes`.
 
-Use `cluster_defaults` for shared Alliance Canada / Compute Canada policies,
-setup notes, and documentation sources. Individual clusters can add or override
-cluster-specific details such as docs, storage paths, accounts, partitions, or
-GPU request style.
+**Git:** `remote_git_status`, `remote_git_rev`, `remote_git_branch`,
+`remote_git_fetch`, `remote_git_pull` (fast-forward only, dry run by default),
+`remote_git_checkout`, `remote_git_clone`, `sync_local_commits`. Tools that
+change files on the cluster refuse to run when the remote repository has
+uncommitted changes. `sync_local_commits` refuses to overwrite remote
+history that has diverged from yours.
 
-Operational notes that are useful to both humans and agents can live in local
-markdown files such as `docs/alliance-canada.md`, then be referenced from
-`cluster_defaults.docs` or a cluster's `docs` list.
+**Python environments:** `setup_venv`, `venv_info`, `check_wheels`
+(`avail_wheels`). Builds follow the Alliance pattern: `module load python`,
+`virtualenv --no-download`, `pip install --no-index` from the wheelhouse.
+Pass `no_index=False` for packages that are only on PyPI.
 
-## 4. Run locally
+**Hugging Face:** `hf_download`, `hf_cache_list`, `hf_store_token`.
 
-Install in editable mode:
+**Background tasks:** `remote_task_status`, `list_remote_tasks`,
+`cancel_remote_task`. Long login-node work (venv builds, downloads) runs
+detached under `run_root/mcp-tasks/<task_id>/`. That folder holds
+`task.sh`, `output.log`, and `exit_code`, so status survives reconnects.
 
-```bash
-python -m pip install -e .
-```
+**Escape hatch:** `run_remote_command` runs any bash command, but only when
+`allow_remote_shell: true` is set.
 
-Run the MCP server:
+## Job submission details
 
-```bash
-alliance-slurm-mcp --config config.yaml
-```
+Profiles in `config.yaml` set `sbatch` options: `time`, `mem`,
+`mem_per_cpu`, `cpus_per_task`, `gpus`, `gpu_type`, `gres`, `nodes`,
+`ntasks`, `ntasks_per_node`, `partition`, `account`, `qos`, `constraint`,
+`array`, `dependency`, `exclusive`, `signal`, `output`, `error`,
+`mail_type`, `mail_user`, `env`, `sbatch_options`. A `submit_job` call can
+override any of these with `overrides`.
 
-For Codex or Claude Code, configure the command as the local MCP server command
-and pass the same `--config config.yaml` argument.
+Jobs start with `--export=ALL,...` plus their environment variables, added
+in this order:
 
-## Current tools
+1. The Hugging Face cache variables (`HF_HOME`, plus the offline flags when
+   compute nodes have no internet).
+2. `slurm.job_env`.
+3. The profile's `env`.
+4. The call's `env`.
 
-- `list_clusters()`
-- `cluster_info(cluster=None)`
-- `cluster_docs(cluster=None)`
-- `cluster_preflight(cluster=None, write_check=False)`
-- `cluster_auth_status(cluster=None)`
-- `remote_whoami(cluster=None)`
-- `list_job_profiles(cluster=None)`
-- `list_jobs(cluster=None, states=None)`
-- `job_status(job_id, cluster=None)`
-- `submit_job(profile, script, cluster=None, job_name=None, script_args=None, dry_run=False)`
-- `list_run_files(cluster=None, path=None, limit=100, max_depth=4)`
-- `read_file(path, cluster=None, max_bytes=20000, base="run_root")`
-- `tail_file(path, cluster=None, lines=100, base="run_root")`
-- `grep_files(pattern, path=None, cluster=None, limit=50, base="run_root")`
-- `job_logs(job_id, cluster=None, limit=20)`
-- `tail_job_log(job_id, stream="stdout", cluster=None, lines=100)`
-- `remote_git_status(cluster=None)`
-- `remote_git_rev(cluster=None)`
-- `remote_git_branch(cluster=None)`
-- `remote_git_pull(cluster=None, dry_run=True)`
-
-The server intentionally does not expose an arbitrary remote shell.
-
-## Preflight
-
-Run `cluster_preflight()` before asking an agent to submit work. It checks the
-SSH master connection, remote user, required command-line tools, configured
-storage roots, job profile validity, and remote Git status.
-
-By default, preflight is read-only. Use `write_check=True` to let it create and
-check writability of `storage.run_root/logs`.
-
-## Job API shape
-
-Slurm tools return structured dictionaries/lists rather than terminal tables.
-`list_jobs` parses `squeue`, while `job_status` combines live `squeue` state
-with `sacct` accounting records when available.
-
-Job submission is profile-based. The `script` argument must be a relative path
-inside the configured `storage.remote_repo`, such as `scripts/train.slurm`.
-Profiles can define common `sbatch` options such as:
-
-- `time`
-- `mem`
-- `cpus_per_task`
-- `gpus`
-- `gpu_type`
-- `nodes`
-- `ntasks`
-- `partition`
-- `account`
-- `qos`
-- `constraint`
-- `output`
-- `error`
-- `sbatch_options`
-
-Use `dry_run=True` to preview the remote repository, log directory, and exact
-`sbatch` argv without contacting the cluster or submitting a job.
-
-## Log and output inspection
-
-Remote file tools are constrained to the configured `storage.remote_repo` and
-`storage.run_root` roots. Relative file paths are resolved under `run_root` by
-default. Pass `base="remote_repo"` to inspect repository files.
-
-For example:
-
-```python
-list_run_files(limit=20)
-tail_job_log("123456", stream="stderr", lines=100)
-read_file("logs/train-123456.out", max_bytes=20000)
-grep_files("Traceback", path="logs", limit=20)
-```
-
-Absolute remote paths are accepted only when they are inside one of the
-configured roots.
+Logs go to `run_root/logs/%x-%j.out` and `%x-%j.err` unless the profile sets
+`output` or `error`.
 
 ## Audit log
 
-Remote actions are logged locally as JSONL. By default, the log is written to
-`.slurm-mcp-audit.jsonl` next to the config file. Set `audit_log: null` in
-`config.yaml` to disable audit logging.
+Remote actions are appended to `.slurm-mcp-audit.jsonl` next to the config
+file. Each entry records the command, return code, and the start of the
+output. Data sent over stdin, such as file contents and the HF token, is
+not logged. Set `audit_log: null` to turn the log off.
 
-## Remote Git
+## Development
 
-Remote Git tools operate only inside `storage.remote_repo`.
+```bash
+python -m pytest
+```
 
-`remote_git_status`, `remote_git_rev`, and `remote_git_branch` are read-only.
-`remote_git_pull` defaults to `dry_run=True`, which runs `git fetch --dry-run
---verbose`. To perform an actual update, call it with `dry_run=False`; the MCP
-will refuse to pull if the remote repository has uncommitted changes, and it
-uses `git pull --ff-only`.
+`tests/test_server.py` runs the tools against local bash in place of SSH, so
+the quoting, file transfers, background tasks, and git-bundle sync are all
+exercised for real. On Windows this requires Git Bash.

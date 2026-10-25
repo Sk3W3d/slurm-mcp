@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ class ClusterDefaults:
     setup_hints: dict[str, tuple[str, ...]] | None = None
     slurm: dict[str, Any] | None = None
     storage: dict[str, str] | None = None
+    python: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,7 @@ class Cluster:
     setup_hints: dict[str, tuple[str, ...]] | None = None
     slurm: dict[str, Any] | None = None
     storage: dict[str, str] | None = None
+    python: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,33 @@ class Settings:
     profiles: dict[str, Any] | None = None
     config_dir: Path = Path(".")
     audit_log: str | None = ".slurm-mcp-audit.jsonl"
+    # "auto" picks paramiko on Windows (no usable ControlMaster) and openssh elsewhere.
+    ssh_backend: str = "auto"
+    ssh_config: str | None = None
+    known_hosts: str | None = None
+    duo_option: str = "1"
+    keepalive_seconds: int = 60
+    allow_remote_shell: bool = False
+    max_transfer_bytes: int = 200_000_000
+    # Local directories that upload/download/sync tools may touch. Empty means the
+    # server's working directory at startup.
+    local_roots: tuple[str, ...] = ()
+
+    def resolved_ssh_backend(self) -> str:
+        if self.ssh_backend != "auto":
+            return self.ssh_backend
+        return "paramiko" if sys.platform == "win32" else "openssh"
+
+    def local_root_paths(self) -> tuple[Path, ...]:
+        if not self.local_roots:
+            return (Path.cwd().resolve(),)
+        paths: list[Path] = []
+        for root in self.local_roots:
+            path = Path(root).expanduser()
+            if not path.is_absolute():
+                path = self.config_dir / path
+            paths.append(path.resolve())
+        return tuple(paths)
 
     def get_cluster(self, name: str | None = None) -> Cluster:
         cluster_name = name or self.default_cluster
@@ -69,6 +99,7 @@ class Settings:
             ),
             "slurm": _merge_dicts(self.cluster_defaults.slurm, cluster.slurm),
             "storage": storage,
+            "python": _merge_dicts(self.cluster_defaults.python, cluster.python),
             "profiles": deepcopy(self.profiles or {}),
         }
 
@@ -156,6 +187,7 @@ def load_settings(path: str | Path) -> Settings:
             setup_hints=_setup_hints(value, "setup_hints"),
             slurm=_plain_mapping(value, "slurm"),
             storage=storage,
+            python=_plain_mapping(value, "python"),
         )
 
     default_cluster = raw.get("default_cluster") or next(iter(clusters))
@@ -170,7 +202,36 @@ def load_settings(path: str | Path) -> Settings:
         profiles=_plain_mapping(raw, "profiles"),
         config_dir=config_path.parent,
         audit_log=_audit_log_setting(raw),
+        ssh_backend=_choice(raw, "ssh_backend", {"auto", "openssh", "paramiko"}, "auto"),
+        ssh_config=_optional_string(raw, "ssh_config"),
+        known_hosts=_optional_string(raw, "known_hosts"),
+        duo_option=str(raw.get("duo_option", "1")),
+        keepalive_seconds=_positive_int(raw, "keepalive_seconds", 60),
+        allow_remote_shell=_bool(raw, "allow_remote_shell", False),
+        max_transfer_bytes=_positive_int(raw, "max_transfer_bytes", 200_000_000),
+        local_roots=_string_tuple(raw, "local_roots"),
     )
+
+
+def _choice(mapping: dict[str, Any], key: str, choices: set[str], default: str) -> str:
+    value = mapping.get(key, default)
+    if value not in choices:
+        raise ValueError(f"'{key}' must be one of: {', '.join(sorted(choices))}.")
+    return str(value)
+
+
+def _positive_int(mapping: dict[str, Any], key: str, default: int) -> int:
+    value = mapping.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"'{key}' must be a positive integer.")
+    return value
+
+
+def _bool(mapping: dict[str, Any], key: str, default: bool) -> bool:
+    value = mapping.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"'{key}' must be true or false.")
+    return value
 
 
 def _cluster_defaults(raw: Any) -> ClusterDefaults:
@@ -182,6 +243,7 @@ def _cluster_defaults(raw: Any) -> ClusterDefaults:
         setup_hints=_setup_hints(raw, "setup_hints"),
         slurm=_plain_mapping(raw, "slurm"),
         storage=_string_mapping(raw, "storage"),
+        python=_plain_mapping(raw, "python"),
     )
 
 

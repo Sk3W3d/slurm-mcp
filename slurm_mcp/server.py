@@ -2,13 +2,23 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 
+from . import huggingface as hf
+from . import python_env
+from . import remote_tasks
 from .audit import preview_text, write_audit_event
 from .config import Cluster, Settings, load_settings
+from .local_files import check_transfer_size, local_git_ok, resolve_local_path, run_local_git
 from .remote_files import (
+    REQUIRED_ROOT_KEYS,
     allowed_roots_from_storage,
     classify_job_log,
     find_job_logs_argv,
@@ -18,6 +28,7 @@ from .remote_files import (
     parse_grep_output,
     parse_stat_output,
     read_file_argv,
+    remote_parent,
     resolve_remote_path,
     select_job_log,
     stat_file_argv,
@@ -27,25 +38,42 @@ from .remote_files import (
     validate_line_count,
     validate_max_bytes,
     validate_max_depth,
+    write_file_argv,
 )
 from .remote_git import (
+    SYNC_BUNDLE_NAME,
     git_branch_argv,
+    git_bundle_fetch_argv,
+    git_bundle_pull_argv,
+    git_checkout_argv,
+    git_clone_argv,
+    git_fetch_argv,
     git_fetch_dry_run_argv,
     git_pull_argv,
     git_rev_argv,
     git_status_argv,
     parse_git_status,
+    validate_git_ref,
 )
 from .slurm import (
     build_sbatch_argv,
+    merge_env,
+    merge_job_options,
     parse_sacct,
     parse_sbatch_job_id,
+    parse_sinfo,
     parse_squeue,
+    parse_sshare,
     sacct_argv,
+    sacct_user_argv,
+    scancel_argv,
+    sinfo_argv,
     squeue_argv,
     squeue_job_argv,
+    sshare_argv,
+    submit_accounts,
 )
-from .ssh import CommandResult, check_master, remote_command_result, remote_command_result_in_dir
+from .ssh import CommandResult, OpenSSHBackend, SSHBackend, argv_in_dir
 from .validators import (
     validate_argument_list,
     validate_job_id,
@@ -57,12 +85,33 @@ from .validators import (
 
 mcp = FastMCP("alliance-slurm")
 settings: Settings | None = None
+backend: SSHBackend | None = None
 
 
 def get_settings() -> Settings:
     if settings is None:
         raise RuntimeError("Server settings are not initialized.")
     return settings
+
+
+def get_backend() -> SSHBackend:
+    if backend is None:
+        raise RuntimeError("SSH backend is not initialized.")
+    return backend
+
+
+def make_backend(current_settings: Settings) -> SSHBackend:
+    if current_settings.resolved_ssh_backend() == "openssh":
+        return OpenSSHBackend(current_settings.ssh_command)
+    from .ssh_paramiko import ParamikoBackend
+
+    return ParamikoBackend(
+        ssh_config=Path(current_settings.ssh_config).expanduser() if current_settings.ssh_config else None,
+        known_hosts=Path(current_settings.known_hosts).expanduser() if current_settings.known_hosts else None,
+        default_users={c.host: c.user for c in current_settings.clusters.values() if c.user},
+        duo_option=current_settings.duo_option,
+        keepalive_seconds=current_settings.keepalive_seconds,
+    )
 
 
 @mcp.tool()
@@ -113,14 +162,48 @@ def cluster_auth_status(cluster: str | None = None) -> dict[str, object]:
     """Check whether an SSH master connection is alive for a cluster."""
     current_settings = get_settings()
     target = current_settings.get_cluster(cluster)
-    result = check_master(current_settings.ssh_command, target.host)
+    result = get_backend().check(target.host)
     message = (result.stderr or result.stdout).strip()
     return {
         "cluster": target.name,
         "host": target.host,
         "connected": result.returncode == 0,
         "message": message,
+        "backend": get_backend().name,
     }
+
+
+@mcp.tool()
+async def cluster_login(cluster: str | None = None, passcode: str | None = None) -> dict[str, object]:
+    """Open an authenticated SSH connection to a cluster (paramiko backend).
+
+    Uses your SSH key, then answers the Alliance Duo prompt by sending a push
+    (or the given one-time passcode). Tell the user to approve the Duo push on
+    their phone; this call waits up to two minutes for it. With the openssh
+    backend this only reports whether a ControlMaster session exists.
+    """
+    current_settings = get_settings()
+    target = current_settings.get_cluster(cluster)
+    event: dict[str, Any] = {"tool": "cluster_login", "cluster": target.name, "host": target.host}
+    try:
+        result = await anyio.to_thread.run_sync(
+            lambda: get_backend().login(target.host, passcode=passcode or None)
+        )
+    except Exception as exc:
+        _write_remote_audit(current_settings, {**event, "exception": repr(exc)})
+        raise
+    _write_remote_audit(current_settings, {**event, "connected": result.get("connected")})
+    return {"cluster": target.name, "host": target.host, "backend": get_backend().name, **result}
+
+
+@mcp.tool()
+def cluster_logout(cluster: str | None = None) -> dict[str, object]:
+    """Close the SSH connection to a cluster."""
+    current_settings = get_settings()
+    target = current_settings.get_cluster(cluster)
+    result = get_backend().logout(target.host)
+    _write_remote_audit(current_settings, {"tool": "cluster_logout", "cluster": target.name, "host": target.host})
+    return {"cluster": target.name, "host": target.host, **result}
 
 
 @mcp.tool()
@@ -223,9 +306,18 @@ def submit_job(
     cluster: str | None = None,
     job_name: str | None = None,
     script_args: list[str] | None = None,
+    overrides: dict[str, Any] | None = None,
+    env: dict[str, str] | None = None,
     dry_run: bool = False,
 ) -> dict[str, object]:
-    """Submit a Slurm job using a configured profile and a script under remote_repo."""
+    """Submit a Slurm job using a configured profile and a script under remote_repo.
+
+    overrides replaces profile keys for this submission only (for example
+    {"time": "02:00:00", "gpus": 2, "array": "0-9", "dependency": "afterok:123"}).
+    env adds variables via --export=ALL,...; when storage.hf_home is set, HF_HOME
+    and (on clusters without compute-node internet) the HF offline flags are
+    added automatically. Use dry_run=True to preview the exact sbatch argv.
+    """
     current_settings = get_settings()
     target = current_settings.get_cluster(cluster)
     info = current_settings.cluster_info(cluster)
@@ -237,17 +329,25 @@ def submit_job(
     if not isinstance(remote_repo, str) or not remote_repo:
         raise ValueError("Cluster must define storage.remote_repo before jobs can be submitted.")
 
-    profile_data = current_settings.get_profile(profile)
-    safe_script = validate_remote_relative_path(script, "script")
-    safe_job_name = validate_job_name(job_name) if job_name else None
-    safe_script_args = validate_argument_list(script_args, "script_args")
-
     slurm_info = info.get("slurm", {})
     if not isinstance(slurm_info, dict):
         raise ValueError("Cluster Slurm configuration must be a mapping.")
     submit_command = str(slurm_info.get("submit_command", "sbatch"))
     if submit_command != "sbatch":
         raise ValueError("Only the sbatch submit command is currently supported.")
+
+    if overrides is not None and not isinstance(overrides, dict):
+        raise ValueError("overrides must be a mapping of profile keys to values.")
+    default_account = slurm_info.get("default_account")
+    profile_data = merge_job_options(
+        current_settings.get_profile(profile),
+        overrides,
+        default_account=str(default_account) if default_account else None,
+    )
+    safe_script = validate_remote_relative_path(script, "script")
+    safe_job_name = validate_job_name(job_name) if job_name else None
+    safe_script_args = validate_argument_list(script_args, "script_args")
+    job_env = _job_env(info, profile_data.get("env"), env)
 
     log_dir = f"{run_root}/logs" if isinstance(run_root, str) and run_root else None
     argv = build_sbatch_argv(
@@ -257,6 +357,7 @@ def submit_job(
         script_args=safe_script_args,
         cluster_slurm=slurm_info,
         log_dir=log_dir,
+        env=job_env,
     )
 
     preview = {
@@ -267,6 +368,7 @@ def submit_job(
         "remote_repo": remote_repo,
         "run_root": run_root,
         "log_dir": log_dir,
+        "env": job_env,
         "argv": argv,
         "dry_run": dry_run,
     }
@@ -310,6 +412,90 @@ def submit_job(
         "stdout": stdout,
         "expected_stdout": f"{log_dir}/%x-{job_id}.out" if log_dir else None,
         "expected_stderr": f"{log_dir}/%x-{job_id}.err" if log_dir else None,
+    }
+
+
+@mcp.tool()
+def cancel_job(job_id: str, cluster: str | None = None) -> dict[str, object]:
+    """Cancel one of your own Slurm jobs (scancel --user=<you>)."""
+    current_settings = get_settings()
+    target = current_settings.get_cluster(cluster)
+    safe_job_id = validate_job_id(job_id)
+    user = _remote_user(current_settings, target, tool="cancel_job")
+    result = _run_remote_result(
+        current_settings,
+        target,
+        scancel_argv(safe_job_id, user),
+        tool="cancel_job",
+        timeout=30,
+    )
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "job_id": safe_job_id,
+        "ok": result.returncode == 0,
+        "stdout": result.stdout.strip(),
+        "error": _command_error(result.returncode, result.stderr),
+    }
+
+
+@mcp.tool()
+def job_history(cluster: str | None = None, days: int = 7, limit: int = 100) -> dict[str, object]:
+    """List your recent jobs from Slurm accounting (sacct), newest first."""
+    current_settings = get_settings()
+    target = current_settings.get_cluster(cluster)
+    if not isinstance(days, int) or days < 1 or days > 90:
+        raise ValueError("days must be an integer between 1 and 90.")
+    safe_limit = validate_limit(limit)
+    user = _remote_user(current_settings, target, tool="job_history")
+    start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    output = _run_remote_output(
+        current_settings,
+        target,
+        sacct_user_argv(user, start),
+        tool="job_history",
+        timeout=60,
+    )
+    jobs = parse_sacct(output)
+    jobs.reverse()
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "user": user,
+        "since": start,
+        "count": min(len(jobs), safe_limit),
+        "total": len(jobs),
+        "jobs": jobs[:safe_limit],
+    }
+
+
+@mcp.tool()
+def cluster_partitions(cluster: str | None = None) -> dict[str, object]:
+    """Summarize Slurm partitions, node states, CPUs, memory, and GPUs (sinfo)."""
+    current_settings = get_settings()
+    target = current_settings.get_cluster(cluster)
+    output = _run_remote_output(current_settings, target, sinfo_argv(), tool="cluster_partitions", timeout=30)
+    rows = parse_sinfo(output)
+    return {"cluster": target.name, "host": target.host, "count": len(rows), "partitions": rows}
+
+
+@mcp.tool()
+def slurm_accounts(cluster: str | None = None) -> dict[str, object]:
+    """List the allocation accounts you can submit with (e.g. def-pi) and fair-share usage."""
+    current_settings = get_settings()
+    target = current_settings.get_cluster(cluster)
+    user = _remote_user(current_settings, target, tool="slurm_accounts")
+    output = _run_remote_output(current_settings, target, sshare_argv(user), tool="slurm_accounts", timeout=30)
+    rows = parse_sshare(output)
+    info = current_settings.cluster_info(target.name)
+    slurm_info = info.get("slurm") if isinstance(info.get("slurm"), dict) else {}
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "user": user,
+        "accounts": submit_accounts(rows),
+        "configured_default_account": slurm_info.get("default_account"),
+        "fair_share": rows,
     }
 
 
@@ -511,6 +697,153 @@ def tail_job_log(
     }
 
 
+_WRITE_FILE_MAX_BYTES = 1_000_000
+
+
+@mcp.tool()
+def write_file(
+    path: str,
+    content: str,
+    cluster: str | None = None,
+    base: str = "remote_repo",
+    overwrite: bool = False,
+    executable: bool = False,
+) -> dict[str, object]:
+    """Write a text file (such as a Slurm job script) inside an allowlisted remote root.
+
+    Relative paths resolve under base (remote_repo by default). Refuses to
+    replace an existing file unless overwrite=True.
+    """
+    current_settings = get_settings()
+    target, roots = _file_context(current_settings, cluster)
+    resolved = resolve_remote_path(path, roots, base=validate_file_base(base), label="path")
+    if not resolved.relative:
+        raise ValueError("path must name a file inside the root, not the root itself.")
+    data = content.encode("utf-8")
+    if len(data) > _WRITE_FILE_MAX_BYTES:
+        raise ValueError(f"content is larger than {_WRITE_FILE_MAX_BYTES} bytes; use upload_file instead.")
+    result = _run_remote_result(
+        current_settings,
+        target,
+        write_file_argv(resolved.path, executable=executable, overwrite=overwrite),
+        tool="write_file",
+        timeout=60,
+        input_data=data,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "remote write failed")
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "path": resolved.path,
+        "root": resolved.root_name,
+        "relative_path": resolved.relative,
+        "bytes": len(data),
+        "executable": executable,
+    }
+
+
+@mcp.tool()
+def upload_file(
+    local_path: str,
+    remote_path: str,
+    cluster: str | None = None,
+    base: str = "remote_repo",
+    overwrite: bool = False,
+) -> dict[str, object]:
+    """Copy a local file (inside local_roots) to an allowlisted remote root."""
+    current_settings = get_settings()
+    target, roots = _file_context(current_settings, cluster)
+    source = resolve_local_path(local_path, current_settings.local_root_paths(), label="local_path")
+    if not source.is_file():
+        raise ValueError(f"Local file not found: {source}")
+    size = source.stat().st_size
+    check_transfer_size(size, current_settings.max_transfer_bytes, "Local file")
+    resolved = resolve_remote_path(remote_path, roots, base=validate_file_base(base), label="remote_path")
+    if not resolved.relative:
+        raise ValueError("remote_path must name a file inside the root, not the root itself.")
+
+    precheck = 'mkdir -p -- "$1"'
+    if not overwrite:
+        precheck += ' && if [ -e "$2" ]; then echo "Refusing to overwrite existing file: $2" >&2; exit 17; fi'
+    _run_remote_output(
+        current_settings,
+        target,
+        ["bash", "-c", precheck, "_", remote_parent(resolved.path), resolved.path],
+        tool="upload_file",
+        timeout=30,
+    )
+    _transfer(
+        current_settings,
+        target,
+        "upload_file",
+        {"local_path": str(source), "remote_path": resolved.path, "bytes": size},
+        lambda: get_backend().upload(target.host, source, resolved.path),
+    )
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "local_path": str(source),
+        "path": resolved.path,
+        "root": resolved.root_name,
+        "relative_path": resolved.relative,
+        "bytes": size,
+    }
+
+
+@mcp.tool()
+def download_file(
+    remote_path: str,
+    local_path: str | None = None,
+    cluster: str | None = None,
+    base: str = "run_root",
+    overwrite: bool = False,
+) -> dict[str, object]:
+    """Copy a remote file from an allowlisted root to the local machine.
+
+    Without local_path, the file lands in <first local root>/slurm-mcp-downloads/<cluster>/<root>/<relative path>.
+    """
+    current_settings = get_settings()
+    target, roots = _file_context(current_settings, cluster)
+    resolved = resolve_remote_path(remote_path, roots, base=validate_file_base(base), label="remote_path")
+    local_roots = current_settings.local_root_paths()
+    if local_path:
+        destination = resolve_local_path(local_path, local_roots, label="local_path")
+    else:
+        destination = resolve_local_path(
+            "/".join(["slurm-mcp-downloads", target.name, resolved.root_name, resolved.relative or "root"]),
+            local_roots,
+            label="local_path",
+        )
+    if destination.exists() and not overwrite:
+        raise ValueError(f"Local file already exists: {destination}. Pass overwrite=True to replace it.")
+
+    metadata = parse_stat_output(
+        _run_remote_output(current_settings, target, stat_file_argv(resolved.path), tool="download_file", timeout=15)
+    )
+    if metadata.get("file_type") not in {"regular file", "regular empty file"}:
+        raise ValueError(f"Remote path is not a regular file: {resolved.path}")
+    size = metadata.get("size_bytes")
+    if isinstance(size, int):
+        check_transfer_size(size, current_settings.max_transfer_bytes, "Remote file")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _transfer(
+        current_settings,
+        target,
+        "download_file",
+        {"remote_path": resolved.path, "local_path": str(destination), "bytes": size},
+        lambda: get_backend().download(target.host, resolved.path, destination),
+    )
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "path": resolved.path,
+        "local_path": str(destination),
+        "bytes": destination.stat().st_size,
+    }
+
+
 @mcp.tool()
 def cluster_preflight(cluster: str | None = None, write_check: bool = False) -> dict[str, object]:
     """Check whether a configured cluster/project is ready for agent workflows."""
@@ -518,7 +851,7 @@ def cluster_preflight(cluster: str | None = None, write_check: bool = False) -> 
     target = current_settings.get_cluster(cluster)
     checks: list[dict[str, object]] = []
 
-    auth_result = check_master(current_settings.ssh_command, target.host)
+    auth_result = get_backend().check(target.host)
     auth_ok = auth_result.returncode == 0
     checks.append(
         {
@@ -603,6 +936,19 @@ def cluster_preflight(cluster: str | None = None, write_check: bool = False) -> 
             )
         )
 
+    for tool_name in ("setsid", "avail_wheels"):
+        # Needed by background tasks (venv builds, HF downloads), not by core Slurm tools.
+        checks.append(
+            _preflight_remote_check(
+                current_settings,
+                target,
+                f"tool:{tool_name}",
+                ["bash", "-lc", f"command -v {tool_name}"],
+                required=False,
+                timeout=15,
+            )
+        )
+
     if storage_ok:
         for root_name, root in roots.items():
             checks.append(
@@ -611,7 +957,7 @@ def cluster_preflight(cluster: str | None = None, write_check: bool = False) -> 
                     target,
                     f"storage_exists:{root_name}",
                     ["test", "-d", root],
-                    required=True,
+                    required=root_name in REQUIRED_ROOT_KEYS,
                     timeout=15,
                 )
             )
@@ -826,6 +1172,524 @@ def remote_git_pull(cluster: str | None = None, dry_run: bool = True) -> dict[st
     }
 
 
+@mcp.tool()
+def remote_git_fetch(cluster: str | None = None) -> dict[str, object]:
+    """Fetch (git fetch --prune) in the remote repository without touching the working tree."""
+    current_settings = get_settings()
+    target, remote_repo = _repo_context(current_settings, cluster)
+    result = _run_remote_result(
+        current_settings, target, git_fetch_argv(remote_repo), tool="remote_git_fetch", timeout=300
+    )
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "remote_repo": remote_repo,
+        "ok": result.returncode == 0,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+@mcp.tool()
+def remote_git_checkout(ref: str, cluster: str | None = None) -> dict[str, object]:
+    """Check out a branch, tag, or commit in the remote repository (refuses if it has uncommitted changes)."""
+    current_settings = get_settings()
+    target, remote_repo = _repo_context(current_settings, cluster)
+    safe_ref = validate_git_ref(ref)
+    status = _remote_git_status(current_settings, target, remote_repo, "remote_git_checkout")
+    if not status["clean"]:
+        raise ValueError("Refusing to check out because the remote repository has uncommitted changes.")
+    result = _run_remote_result(
+        current_settings, target, git_checkout_argv(remote_repo, safe_ref), tool="remote_git_checkout", timeout=120
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "remote git checkout failed")
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "remote_repo": remote_repo,
+        "ref": safe_ref,
+        "commit": _run_remote_output(
+            current_settings, target, git_rev_argv(remote_repo), tool="remote_git_checkout", timeout=30
+        ),
+        "stderr": result.stderr.strip(),
+    }
+
+
+@mcp.tool()
+def remote_git_clone(url: str, cluster: str | None = None, branch: str | None = None) -> dict[str, object]:
+    """Clone a Git repository into the configured storage.remote_repo (which must not exist yet).
+
+    The cluster needs read access to the URL: a public https URL, or an SSH
+    URL for which the cluster account has a deploy key.
+    """
+    current_settings = get_settings()
+    target, remote_repo = _repo_context(current_settings, cluster)
+    argv = git_clone_argv(url, remote_repo, branch)
+    exists = _run_remote_result(
+        current_settings, target, ["test", "-e", remote_repo], tool="remote_git_clone", timeout=15
+    )
+    if exists.returncode == 0:
+        raise ValueError(f"{remote_repo} already exists. Use remote_git_pull or sync_local_commits instead.")
+    _run_remote_output(
+        current_settings, target, ["mkdir", "-p", remote_parent(remote_repo)], tool="remote_git_clone", timeout=30
+    )
+    result = _run_remote_result(current_settings, target, argv, tool="remote_git_clone", timeout=900)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "remote git clone failed")
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "remote_repo": remote_repo,
+        "commit": _run_remote_output(
+            current_settings, target, git_rev_argv(remote_repo), tool="remote_git_clone", timeout=30
+        ),
+        "stderr": result.stderr.strip(),
+    }
+
+
+@mcp.tool()
+def sync_local_commits(
+    local_repo: str | None = None,
+    branch: str | None = None,
+    cluster: str | None = None,
+    checkout: bool = True,
+    init_if_missing: bool = True,
+) -> dict[str, object]:
+    """Send committed local work to the remote repository without going through GitHub.
+
+    Builds a git bundle of the local branch (only commits the cluster lacks),
+    uploads it, and fast-forwards the same branch in storage.remote_repo.
+    If remote_repo does not exist yet, it is created (init_if_missing).
+    Uncommitted local changes are not sent. Refuses to rewrite history: if the
+    remote branch has diverged, it fails instead of overwriting.
+    """
+    current_settings = get_settings()
+    target, remote_repo = _repo_context(current_settings, cluster)
+    repo = resolve_local_path(local_repo, current_settings.local_root_paths(), label="local_repo")
+    repo = Path(run_local_git(repo, ["rev-parse", "--show-toplevel"]))
+    safe_branch = validate_git_ref(branch or run_local_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "branch")
+    if safe_branch == "HEAD":
+        raise ValueError("Local repository is in detached HEAD state; pass branch explicitly.")
+    local_commit = run_local_git(repo, ["rev-parse", f"refs/heads/{safe_branch}"])
+    local_dirty = bool(run_local_git(repo, ["status", "--porcelain"]))
+
+    initialized = False
+    has_repo = _run_remote_result(
+        current_settings, target, ["test", "-e", f"{remote_repo}/.git"], tool="sync_local_commits", timeout=15
+    )
+    if has_repo.returncode != 0:
+        if not init_if_missing:
+            raise ValueError(f"{remote_repo} is not a Git repository. Pass init_if_missing=True or clone it first.")
+        # A placeholder initial branch keeps the target branch free, since Git will not fetch into the
+        # checked-out branch; it disappears once the real branch is checked out.
+        init_script = (
+            'if [ -e "$1" ] && [ -n "$(ls -A -- "$1")" ]; then echo "$1 exists and is not empty" >&2; exit 17; fi; '
+            'mkdir -p -- "$1" && git init -q --initial-branch=slurm-mcp-unborn -- "$1"'
+        )
+        _run_remote_output(
+            current_settings, target, ["bash", "-c", init_script, "_", remote_repo], tool="sync_local_commits", timeout=60
+        )
+        initialized = True
+
+    status = _remote_git_status(current_settings, target, remote_repo, "sync_local_commits")
+    remote_branch_commit = _remote_rev(current_settings, target, remote_repo, f"refs/heads/{safe_branch}")
+    remote_head_commit = _remote_rev(current_settings, target, remote_repo, "HEAD")
+    base = {
+        "cluster": target.name,
+        "host": target.host,
+        "remote_repo": remote_repo,
+        "local_repo": str(repo),
+        "branch": safe_branch,
+        "local_commit": local_commit,
+        "remote_commit_before": remote_branch_commit,
+        "local_uncommitted_changes_not_sent": local_dirty,
+        "initialized_remote_repo": initialized,
+    }
+
+    if remote_branch_commit != local_commit:
+        if remote_branch_commit and not local_git_ok(
+            repo, ["merge-base", "--is-ancestor", remote_branch_commit, local_commit]
+        ):
+            raise ValueError(
+                f"Remote branch {safe_branch} ({remote_branch_commit[:12]}) is not an ancestor of the local branch. "
+                "It has diverged; reconcile manually instead of overwriting remote history."
+            )
+        prerequisite = remote_branch_commit or remote_head_commit
+        bundle_args = [safe_branch]
+        # Exclude history the cluster already has; Git refuses an empty bundle, so skip when equal.
+        if prerequisite and prerequisite != local_commit and local_git_ok(repo, ["merge-base", "--is-ancestor", prerequisite, local_commit]):
+            bundle_args.append(f"^{prerequisite}")
+
+        remote_bundle = f"{remote_repo}/.git/{SYNC_BUNDLE_NAME}"
+        with tempfile.TemporaryDirectory(prefix="slurm-mcp-") as tmp:
+            bundle_path = Path(tmp) / SYNC_BUNDLE_NAME
+            run_local_git(repo, ["bundle", "create", str(bundle_path), *bundle_args], timeout=600)
+            size = bundle_path.stat().st_size
+            check_transfer_size(size, current_settings.max_transfer_bytes, "Git bundle")
+            _transfer(
+                current_settings,
+                target,
+                "sync_local_commits",
+                {"local_path": str(bundle_path), "remote_path": remote_bundle, "bytes": size},
+                lambda: get_backend().upload(target.host, bundle_path, remote_bundle),
+            )
+        base["bundle_bytes"] = size
+        try:
+            on_branch = status.get("branch") == safe_branch
+            if on_branch:
+                if not status["clean"]:
+                    raise ValueError("Refusing to update the checked-out branch: remote repository has uncommitted changes.")
+                argv = git_bundle_pull_argv(remote_repo, remote_bundle, safe_branch)
+            else:
+                argv = git_bundle_fetch_argv(remote_repo, remote_bundle, safe_branch)
+            result = _run_remote_result(current_settings, target, argv, tool="sync_local_commits", timeout=300)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "applying git bundle failed")
+        finally:
+            _run_remote_result(
+                current_settings, target, ["rm", "-f", "--", remote_bundle], tool="sync_local_commits", timeout=30
+            )
+
+    checked_out = status.get("branch") == safe_branch
+    if checkout and not checked_out:
+        if not status["clean"]:
+            raise ValueError(
+                f"Branch {safe_branch} was updated, but it was not checked out because the remote repository "
+                "has uncommitted changes."
+            )
+        _run_remote_output(
+            current_settings,
+            target,
+            git_checkout_argv(remote_repo, safe_branch),
+            tool="sync_local_commits",
+            timeout=120,
+        )
+        checked_out = True
+
+    return {
+        **base,
+        "remote_commit_after": _remote_rev(current_settings, target, remote_repo, f"refs/heads/{safe_branch}"),
+        "already_up_to_date": remote_branch_commit == local_commit,
+        "checked_out": checked_out,
+    }
+
+
+@mcp.tool()
+def setup_venv(
+    cluster: str | None = None,
+    name: str | None = None,
+    requirements: str | None = "requirements.txt",
+    packages: list[str] | None = None,
+    python_module: str | None = None,
+    extra_modules: list[str] | None = None,
+    no_index: bool = True,
+    recreate: bool = False,
+) -> dict[str, object]:
+    """Create or update a Python virtualenv on the cluster, Alliance style, as a background task.
+
+    Runs on a login node: module load python (plus extra modules such as
+    'arrow' or 'opencv'), virtualenv --no-download, then pip install with
+    --no-index so wheels come from the Alliance wheelhouse. Set no_index=False
+    for packages that are only on PyPI. requirements is relative to
+    remote_repo (pass null to skip it). Returns a task_id; poll it with
+    remote_task_status. The venv lands in storage.venv_root/<name>.
+    """
+    current_settings = get_settings()
+    target, storage, python_config = _env_context(current_settings, cluster)
+    venv_root = _required_storage(storage, "venv_root", "virtualenv tools")
+    venv = python_env.venv_path(venv_root, name or str(python_config.get("venv_name") or "default"))
+    modules = python_env.resolve_modules(python_config, python_module, extra_modules)
+    if requirements:
+        requirements = validate_remote_relative_path(requirements, "requirements")
+    body = python_env.build_venv_script(
+        venv=venv,
+        modules=modules,
+        remote_repo=storage.get("remote_repo"),
+        requirements=requirements,
+        packages=python_env.validate_packages(packages),
+        no_index=no_index,
+        recreate=recreate,
+    )
+    task = _launch_task(current_settings, target, storage, "venv", body, f"setup_venv {venv}")
+    return {
+        **task,
+        "venv": venv,
+        "modules": modules,
+        "activation": python_env.activation_snippet(venv, modules),
+    }
+
+
+@mcp.tool()
+def venv_info(cluster: str | None = None, name: str | None = None) -> dict[str, object]:
+    """Show whether a virtualenv exists, its modules, installed packages, and how to activate it in a job."""
+    current_settings = get_settings()
+    target, storage, python_config = _env_context(current_settings, cluster)
+    venv_root = _required_storage(storage, "venv_root", "virtualenv tools")
+    venv = python_env.venv_path(venv_root, name or str(python_config.get("venv_name") or "default"))
+    output = _run_remote_output(
+        current_settings, target, python_env.inspect_venv_argv(venv), tool="venv_info", timeout=30, strip=False
+    )
+    details = python_env.parse_venv_inspect(output)
+    modules = details["modules"] or python_env.resolve_modules(python_config, None, None)
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "venv": venv,
+        **details,
+        "activation": python_env.activation_snippet(venv, modules),
+    }
+
+
+@mcp.tool()
+def check_wheels(packages: list[str], cluster: str | None = None, python_version: str | None = None) -> dict[str, object]:
+    """Check which package versions the Alliance wheelhouse provides (avail_wheels)."""
+    current_settings = get_settings()
+    target = current_settings.get_cluster(cluster)
+    result = _run_remote_result(
+        current_settings,
+        target,
+        python_env.avail_wheels_argv(packages, python_version),
+        tool="check_wheels",
+        timeout=60,
+    )
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "ok": result.returncode == 0,
+        "output": result.stdout,
+        "error": _command_error(result.returncode, result.stderr),
+    }
+
+
+@mcp.tool()
+def hf_download(
+    repo_id: str,
+    cluster: str | None = None,
+    repo_type: str = "model",
+    revision: str | None = None,
+    allow_patterns: list[str] | None = None,
+    ignore_patterns: list[str] | None = None,
+    venv: str | None = None,
+) -> dict[str, object]:
+    """Download a Hugging Face model or dataset into the shared HF_HOME cache, as a background task.
+
+    Runs on a login node (which has internet) so jobs on compute nodes without
+    internet can load it offline. Jobs submitted with submit_job automatically
+    get HF_HOME and the offline flags. Gated models need a token on the
+    cluster first (hf_store_token). By default a small helper virtualenv with
+    huggingface_hub is created under venv_root; pass venv to use one of yours.
+    Returns a task_id for remote_task_status.
+    """
+    current_settings = get_settings()
+    target, storage, python_config = _env_context(current_settings, cluster)
+    hf_home = _required_storage(storage, "hf_home", "Hugging Face tools")
+    venv_root = _required_storage(storage, "venv_root", "Hugging Face tools")
+    body = hf.build_download_script(
+        hf_home=hf_home,
+        modules=python_env.resolve_modules(python_config, None, None),
+        venv=python_env.venv_path(venv_root, venv or hf.HF_TOOLS_VENV_NAME),
+        create_venv=venv is None,
+        repo_id=repo_id,
+        repo_type=repo_type,
+        revision=revision,
+        allow_patterns=allow_patterns,
+        ignore_patterns=ignore_patterns,
+    )
+    description = f"hf_download {repo_type} {repo_id}" + (f"@{revision}" if revision else "")
+    task = _launch_task(current_settings, target, storage, "hf", body, description)
+    return {**task, "hf_home": hf_home, "repo_id": repo_id, "repo_type": repo_type}
+
+
+@mcp.tool()
+def hf_cache_list(cluster: str | None = None) -> dict[str, object]:
+    """List models and datasets already cached in the cluster's shared HF_HOME."""
+    current_settings = get_settings()
+    target, storage, _ = _env_context(current_settings, cluster)
+    hf_home = _required_storage(storage, "hf_home", "Hugging Face tools")
+    output = _run_remote_output(
+        current_settings, target, hf.cache_list_argv(hf_home), tool="hf_cache_list", timeout=60, strip=False
+    )
+    entries = hf.parse_cache_list(output)
+    info = current_settings.cluster_info(target.name)
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "hf_home": hf_home,
+        "count": len(entries),
+        "entries": entries,
+        "job_env": _job_env(info, None, None),
+    }
+
+
+@mcp.tool()
+def hf_store_token(cluster: str | None = None) -> dict[str, object]:
+    """Copy the HF_TOKEN environment variable of this MCP server to $HF_HOME/token on the cluster.
+
+    Needed once per cluster for gated or private models. The token is sent over
+    stdin and is never returned or written to the audit log.
+    """
+    current_settings = get_settings()
+    target, storage, _ = _env_context(current_settings, cluster)
+    hf_home = _required_storage(storage, "hf_home", "Hugging Face tools")
+    token = os.environ.get("HF_TOKEN", "").strip()
+    if not token:
+        raise ValueError(
+            "HF_TOKEN is not set in the MCP server's environment. Add it to the server's env in the MCP config."
+        )
+    _run_remote_output(
+        current_settings,
+        target,
+        hf.store_token_argv(hf_home),
+        tool="hf_store_token",
+        timeout=30,
+        input_data=token.encode("utf-8"),
+    )
+    return {"cluster": target.name, "host": target.host, "token_path": f"{hf_home}/token", "stored": True}
+
+
+@mcp.tool()
+def job_script_template(
+    cluster: str | None = None,
+    profile: str | None = None,
+    command: str = "python train.py",
+    venv: str | None = None,
+) -> dict[str, object]:
+    """Draft a Slurm batch script that loads modules, activates the venv, sets HF cache vars, and cds into the repo.
+
+    Resource flags come from the profile at submit time, so the script only
+    carries the environment setup. Save it with write_file, then submit_job.
+    """
+    current_settings = get_settings()
+    target = current_settings.get_cluster(cluster)
+    info = current_settings.cluster_info(target.name)
+    storage = info.get("storage") if isinstance(info.get("storage"), dict) else {}
+    python_config = info.get("python") if isinstance(info.get("python"), dict) else {}
+    if profile:
+        current_settings.get_profile(profile)
+    if "\x00" in command:
+        raise ValueError("command cannot contain NUL characters.")
+
+    lines = ["#!/bin/bash", f"# Generated for cluster {target.name}" + (f", profile {profile}" if profile else "")]
+    lines.append("set -eo pipefail")
+    modules = python_env.resolve_modules(python_config, None, None)
+    venv_root = storage.get("venv_root")
+    if venv_root:
+        venv_path = python_env.venv_path(venv_root, venv or str(python_config.get("venv_name") or "default"))
+        lines.append(python_env.activation_snippet(venv_path, modules))
+    else:
+        lines.extend(python_env.module_load_lines(modules))
+    for name, value in _job_env(info, None, None).items():
+        lines.append(f"export {name}={shlex.quote(value)}")
+    remote_repo = storage.get("remote_repo")
+    if remote_repo:
+        lines.append(f"cd {shlex.quote(remote_repo)}")
+    lines.append('echo "Job $SLURM_JOB_ID on $(hostname) at $(date -Is)"')
+    lines.append(command)
+    return {
+        "cluster": target.name,
+        "script": "\n".join(lines) + "\n",
+        "note": "submit_job adds HF_HOME/offline vars via --export too; exporting them in the script keeps it self-contained.",
+    }
+
+
+@mcp.tool()
+def remote_task_status(task_id: str, cluster: str | None = None, lines: int = 60) -> dict[str, object]:
+    """Check a background task (setup_venv, hf_download): state, exit code, and the tail of its log."""
+    current_settings = get_settings()
+    target, storage, _ = _env_context(current_settings, cluster)
+    run_root = _required_storage(storage, "run_root", "background tasks")
+    directory = remote_tasks.task_dir(run_root, task_id)
+    output = _run_remote_output(
+        current_settings,
+        target,
+        remote_tasks.task_status_argv(directory, validate_line_count(lines)),
+        tool="remote_task_status",
+        timeout=30,
+        strip=False,
+    )
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "task_id": task_id,
+        "task_dir": directory,
+        **remote_tasks.parse_task_status(output),
+    }
+
+
+@mcp.tool()
+def list_remote_tasks(cluster: str | None = None, limit: int = 20) -> dict[str, object]:
+    """List background tasks started by this server on a cluster, newest first."""
+    current_settings = get_settings()
+    target, storage, _ = _env_context(current_settings, cluster)
+    run_root = _required_storage(storage, "run_root", "background tasks")
+    output = _run_remote_output(
+        current_settings,
+        target,
+        remote_tasks.list_tasks_argv(remote_tasks.tasks_root(run_root)),
+        tool="list_remote_tasks",
+        timeout=30,
+        strip=False,
+    )
+    tasks = remote_tasks.parse_task_list(output)
+    return {"cluster": target.name, "host": target.host, "tasks": tasks[: validate_limit(limit)]}
+
+
+@mcp.tool()
+def cancel_remote_task(task_id: str, cluster: str | None = None) -> dict[str, object]:
+    """Stop a running background task (only works from the login node it runs on)."""
+    current_settings = get_settings()
+    target, storage, _ = _env_context(current_settings, cluster)
+    run_root = _required_storage(storage, "run_root", "background tasks")
+    result = _run_remote_result(
+        current_settings,
+        target,
+        remote_tasks.cancel_task_argv(remote_tasks.task_dir(run_root, task_id)),
+        tool="cancel_remote_task",
+        timeout=30,
+    )
+    return {
+        "cluster": target.name,
+        "task_id": task_id,
+        "ok": result.returncode == 0,
+        "error": _command_error(result.returncode, result.stderr),
+    }
+
+
+@mcp.tool()
+def run_remote_command(
+    command: str,
+    cluster: str | None = None,
+    cwd_base: str = "remote_repo",
+    timeout: int = 120,
+) -> dict[str, object]:
+    """Run an arbitrary bash command on the login node. Disabled unless allow_remote_shell: true.
+
+    Keep it lightweight: login nodes are shared, so no training, heavy
+    preprocessing, or long compiles here. Use submit_job for real work.
+    """
+    current_settings = get_settings()
+    if not current_settings.allow_remote_shell:
+        raise ValueError("run_remote_command is disabled. Set allow_remote_shell: true in config.yaml to enable it.")
+    if not isinstance(command, str) or not command.strip() or "\x00" in command:
+        raise ValueError("command must be a non-empty string.")
+    if not isinstance(timeout, int) or timeout < 1 or timeout > 600:
+        raise ValueError("timeout must be between 1 and 600 seconds.")
+    target, roots = _file_context(current_settings, cluster)
+    cwd = resolve_remote_path(None, roots, base=validate_file_base(cwd_base), label="cwd").path
+    result = _run_remote_result(
+        current_settings, target, ["bash", "-lc", command], tool="run_remote_command", timeout=timeout, cwd=cwd
+    )
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "cwd": cwd,
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Alliance Slurm MCP server")
     parser.add_argument(
@@ -837,9 +1701,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    global settings
+    global settings, backend
     args = parse_args()
     settings = load_settings(args.config)
+    backend = make_backend(settings)
     mcp.run()
 
 
@@ -881,6 +1746,102 @@ def _repo_context(settings: Settings, cluster: str | None) -> tuple[Cluster, str
     return target, remote_repo
 
 
+def _env_context(settings: Settings, cluster: str | None) -> tuple[Cluster, dict[str, Any], dict[str, Any]]:
+    target, roots = _file_context(settings, cluster)
+    info = settings.cluster_info(target.name)
+    python_config = info.get("python")
+    return target, roots, python_config if isinstance(python_config, dict) else {}
+
+
+def _required_storage(storage: dict[str, Any], key: str, purpose: str) -> str:
+    value = storage.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Cluster must define storage.{key} before {purpose} can be used.")
+    return value
+
+
+def _job_env(
+    info: dict[str, Any],
+    profile_env: Any,
+    call_env: dict[str, str] | None,
+) -> dict[str, str]:
+    """Environment for jobs: HF cache vars, then cluster slurm.job_env, profile env, and per-call env."""
+    storage = info.get("storage") if isinstance(info.get("storage"), dict) else {}
+    policies = info.get("policies") if isinstance(info.get("policies"), dict) else {}
+    slurm_info = info.get("slurm") if isinstance(info.get("slurm"), dict) else {}
+    for label, value in (("slurm.job_env", slurm_info.get("job_env")), ("profile env", profile_env), ("env", call_env)):
+        if value is not None and not isinstance(value, dict):
+            raise ValueError(f"{label} must be a mapping of variable names to values.")
+    hf_env = hf.job_env(storage.get("hf_home"), bool(policies.get("compute_node_internet", False)))
+    return merge_env(hf_env, slurm_info.get("job_env"), profile_env, call_env)
+
+
+def _remote_git_status(settings: Settings, target: Cluster, remote_repo: str, tool: str) -> dict[str, Any]:
+    output = _run_remote_output(settings, target, git_status_argv(remote_repo), tool=tool, timeout=30, strip=False)
+    return parse_git_status(output)
+
+
+def _remote_rev(settings: Settings, target: Cluster, remote_repo: str, ref: str) -> str | None:
+    result = _run_remote_result(
+        settings,
+        target,
+        ["git", "-C", remote_repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        tool="git_rev_parse",
+        timeout=30,
+    )
+    commit = result.stdout.strip()
+    return commit if result.returncode == 0 and commit else None
+
+
+def _launch_task(
+    settings: Settings,
+    target: Cluster,
+    storage: dict[str, Any],
+    kind: str,
+    body: str,
+    description: str,
+) -> dict[str, object]:
+    run_root = _required_storage(storage, "run_root", "background tasks")
+    task_id = remote_tasks.new_task_id(kind)
+    directory = remote_tasks.task_dir(run_root, task_id)
+    script_path = f"{directory}/task.sh"
+    script = remote_tasks.wrap_task_script(directory, body, description=description)
+    _run_remote_output(
+        settings,
+        target,
+        write_file_argv(script_path),
+        tool=f"task:{kind}",
+        timeout=30,
+        input_data=script.encode("utf-8"),
+    )
+    pid = _run_remote_output(settings, target, remote_tasks.launch_task_argv(script_path), tool=f"task:{kind}", timeout=30)
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "task_id": task_id,
+        "task_dir": directory,
+        "pid": pid,
+        "description": description,
+        "next_step": f"Poll remote_task_status(task_id='{task_id}') until state is succeeded or failed.",
+    }
+
+
+def _transfer(
+    settings: Settings,
+    target: Cluster,
+    tool: str,
+    details: dict[str, Any],
+    action: Any,
+) -> None:
+    event = {"tool": tool, "cluster": target.name, "host": target.host, **details}
+    try:
+        action()
+    except Exception as exc:
+        _write_remote_audit(settings, {**event, "exception": repr(exc)})
+        raise
+    _write_remote_audit(settings, {**event, "ok": True})
+
+
 def _job_log_files(
     settings: Settings,
     target: Cluster,
@@ -910,8 +1871,9 @@ def _run_remote_output(
     timeout: int,
     cwd: str | None = None,
     strip: bool = True,
+    input_data: bytes | None = None,
 ) -> str:
-    result = _run_remote_result(settings, target, argv, tool=tool, timeout=timeout, cwd=cwd)
+    result = _run_remote_result(settings, target, argv, tool=tool, timeout=timeout, cwd=cwd, input_data=input_data)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"remote command failed with exit code {result.returncode}")
     return result.stdout.strip() if strip else result.stdout
@@ -925,6 +1887,7 @@ def _run_remote_result(
     tool: str,
     timeout: int,
     cwd: str | None = None,
+    input_data: bytes | None = None,
 ) -> CommandResult:
     event: dict[str, Any] = {
         "tool": tool,
@@ -934,16 +1897,8 @@ def _run_remote_result(
         "argv": argv,
     }
     try:
-        if cwd is None:
-            result = remote_command_result(settings.ssh_command, target.host, argv, timeout=timeout)
-        else:
-            result = remote_command_result_in_dir(
-                settings.ssh_command,
-                target.host,
-                cwd,
-                argv,
-                timeout=timeout,
-            )
+        remote_argv = argv if cwd is None else argv_in_dir(cwd, argv)
+        result = get_backend().run(target.host, remote_argv, timeout=timeout, input_data=input_data)
     except Exception as exc:
         _write_remote_audit(settings, {**event, "exception": repr(exc)})
         raise
