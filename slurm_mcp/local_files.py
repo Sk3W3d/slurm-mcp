@@ -32,8 +32,12 @@ def check_transfer_size(size: int, limit: int, label: str) -> None:
 
 
 def run_local_git(repo: Path, args: list[str], *, timeout: int = 120) -> str:
+    # stdin=DEVNULL matters: the server's stdin is the MCP stdio pipe. On Windows a child
+    # that inherits it blocks behind the server's pending read on that pipe, so git never
+    # starts, and subprocess.run's timeout cannot recover (it waits for the pipes again).
     completed = subprocess.run(
         ["git", "-C", str(repo), *args],
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         timeout=timeout,
         check=False,
@@ -47,6 +51,7 @@ def run_local_git(repo: Path, args: list[str], *, timeout: int = 120) -> str:
 def local_git_ok(repo: Path, args: list[str], *, timeout: int = 60) -> bool:
     completed = subprocess.run(
         ["git", "-C", str(repo), *args],
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         timeout=timeout,
         check=False,

@@ -121,6 +121,7 @@ class OpenSSHBackend:
     def download(self, host: str, remote_path: str, local_path: Path, *, timeout: int = 600) -> None:
         completed = subprocess.run(
             [*self.ssh_command, "-o", "BatchMode=yes", "-o", "ControlMaster=no", host, shell_join(["cat", "--", remote_path])],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=timeout,
             check=False,
@@ -154,12 +155,15 @@ def remote_command_result_in_dir(
 
 
 def _run_local(argv: list[str], timeout: int, input_data: bytes | None = None) -> CommandResult:
+    # Never let the child inherit stdin: it is the MCP stdio pipe, and on Windows a
+    # child using that handle while the server is reading from it can hang forever.
+    stdin_args: dict[str, Any] = {"input": input_data} if input_data is not None else {"stdin": subprocess.DEVNULL}
     completed = subprocess.run(
         argv,
-        input=input_data,
         capture_output=True,
         timeout=timeout,
         check=False,
+        **stdin_args,
     )
     return CommandResult(
         returncode=completed.returncode,
