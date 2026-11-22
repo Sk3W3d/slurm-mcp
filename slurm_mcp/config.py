@@ -107,6 +107,8 @@ class Settings:
     profiles: dict[str, Any] | None = None
     config_dir: Path = Path(".")
     audit_log: str | None = ".slurm-mcp-audit.jsonl"
+    # SQLite record of projects, jobs, and tasks. Relative to the config file; None disables it.
+    state_db: str | None = ".slurm-mcp-state.sqlite3"
     # "auto" picks paramiko on Windows (no usable ControlMaster) and openssh elsewhere.
     ssh_backend: str = "auto"
     ssh_config: str | None = None
@@ -223,9 +225,15 @@ class Settings:
         return deepcopy(profile)
 
     def audit_log_path(self) -> Path | None:
-        if self.audit_log is None or self.audit_log == "":
+        return self._config_relative(self.audit_log)
+
+    def state_db_path(self) -> Path | None:
+        return self._config_relative(self.state_db)
+
+    def _config_relative(self, value: str | None) -> Path | None:
+        if value is None or value == "":
             return None
-        path = Path(self.audit_log)
+        path = Path(value).expanduser()
         if path.is_absolute():
             return path
         return self.config_dir / path
@@ -309,7 +317,8 @@ def load_settings(path: str | Path) -> Settings:
         cluster_defaults=defaults,
         profiles=_plain_mapping(raw, "profiles"),
         config_dir=config_path.parent,
-        audit_log=_audit_log_setting(raw),
+        audit_log=_nullable_path_setting(raw, "audit_log", ".slurm-mcp-audit.jsonl"),
+        state_db=_nullable_path_setting(raw, "state_db", ".slurm-mcp-state.sqlite3"),
         ssh_backend=_choice(raw, "ssh_backend", {"auto", "openssh", "paramiko"}, "auto"),
         ssh_config=_optional_string(raw, "ssh_config"),
         known_hosts=_optional_string(raw, "known_hosts"),
@@ -462,14 +471,14 @@ def _optional_string(mapping: dict[str, Any], key: str) -> str | None:
     return value
 
 
-def _audit_log_setting(mapping: dict[str, Any]) -> str | None:
-    if "audit_log" not in mapping:
-        return ".slurm-mcp-audit.jsonl"
-    value = mapping["audit_log"]
+def _nullable_path_setting(mapping: dict[str, Any], key: str, default: str) -> str | None:
+    if key not in mapping:
+        return default
+    value = mapping[key]
     if value is None or value == "":
         return None
     if not isinstance(value, str):
-        raise ValueError("'audit_log' must be a string, null, or an empty string.")
+        raise ValueError(f"'{key}' must be a string, null, or an empty string.")
     return value
 
 

@@ -115,6 +115,38 @@ project picked with `project_use`, or `default_project` from the config.
   error, so a call never lands in the wrong project's folder. The active
   project is ignored on such clusters.
 
+### Project record
+
+The server keeps a local SQLite record (`state_db`, by default
+`.slurm-mcp-state.sqlite3` next to the config file) of what it does for each
+project. Any MCP client that uses the same config shares it, so a Codex
+session sees the jobs a Claude Code session submitted. The tools fill it in
+as a side effect:
+
+| tool | records |
+|---|---|
+| `submit_job` | job id, profile, script, the repo commit (and whether it had uncommitted changes), and an optional `purpose` |
+| `sync_local_commits`, `remote_git_clone`, `remote_git_pull`, `remote_git_checkout` | the commit and branch on the cluster |
+| `setup_venv`, `hf_download` | the background task, and the project's venv |
+| `job_status`, `list_jobs`, `job_history`, `remote_task_status` | the latest state of recorded jobs and tasks |
+
+It stores facts and caches state. A job's state comes from Slurm and is
+saved with the time it was checked (`state_checked_at`), so stale state is
+visible as stale. Read it with:
+
+- `project_status`: where the project lives on each cluster, its unfinished
+  and recent jobs, background tasks, and latest events. On clusters you're
+  connected to, it first refreshes unfinished jobs with one `sacct` call and
+  checks unfinished tasks.
+- `project_history`: the timeline, e.g. `job_submitted`, `job_finished`,
+  `repo_synced`, `task_started` and `task_finished`.
+- `project_list`: also lists recorded projects, most recently active first.
+
+Jobs are linked to their project, so `job_logs` and `tail_job_log` find a
+recorded job's logs without `project=`. A failed write to the record never
+fails the tool. The tool still runs and its result has a `ledger_error` field.
+Set `state_db: null` to turn the record off.
+
 ## 3. Register with Claude Code
 
 ```bash
@@ -144,15 +176,16 @@ the directory Claude Code was started in.
    task that downloads on the login node into `hf_home`.
 6. `job_script_template(command="python train.py")` drafts a script. Save it
    with `write_file("scripts/train.sh", ...)`.
-7. `submit_job("train_gpu", "scripts/train.sh", overrides={"time": "04:00:00"})`
+7. `submit_job("train_gpu", "scripts/train.sh", overrides={"time": "04:00:00"}, purpose="baseline")`
    submits the job. Add `dry_run=True` first to preview the `sbatch` command.
+   Later, `project_status()` shows how the project's jobs are doing.
 8. Check on the job with `job_status`, `tail_job_log`, `list_run_files`,
    `read_file`, `grep_files`, and `download_file`.
 
 ## Tools
 
-**Projects:** `project_use`, `project_list`. Path-based tools below also take
-`project=`.
+**Projects:** `project_use`, `project_list`, `project_status`,
+`project_history`. Path-based tools below also take `project=`.
 
 **Connection and cluster info:** `cluster_login`, `cluster_logout`,
 `cluster_auth_status`, `cluster_preflight`, `remote_whoami`, `list_clusters`,

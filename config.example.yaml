@@ -20,6 +20,11 @@ keepalive_seconds: 60
 # Local JSONL audit log for remote actions. Set to null to disable.
 audit_log: .slurm-mcp-audit.jsonl
 
+# Local SQLite record of projects, jobs, syncs, and background tasks, read by
+# project_status and project_history. Relative to this file; null disables it.
+# Point every MCP client (Claude Code, Codex, ...) at this config to share it.
+state_db: .slurm-mcp-state.sqlite3
+
 # Local directories that upload_file, download_file, and sync_local_commits may use.
 # Defaults to the server's working directory (normally your project).
 # local_roots:

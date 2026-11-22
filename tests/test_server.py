@@ -332,9 +332,20 @@ class ProjectToolTests(unittest.TestCase):
         self.shims = self.tmp / "shims"
         for path in (self.local, self.remote, self.shims):
             path.mkdir(parents=True)
-        setsid = self.shims / "setsid"
-        setsid.write_text('#!/bin/bash\nexec "$@"\n', encoding="utf-8", newline="\n")
-        setsid.chmod(0o755)
+        # Fake Slurm: sbatch hands out increasing job ids; sacct and squeue print fixture files.
+        shims = {
+            "setsid": 'exec "$@"',
+            "sbatch": (
+                f'n=$(cat "{_posix(self.tmp)}/jobid" 2>/dev/null || echo 1000); n=$((n+1)); '
+                f'echo $n > "{_posix(self.tmp)}/jobid"; echo "Submitted batch job $n"'
+            ),
+            "sacct": f'cat "{_posix(self.tmp)}/sacct.out" 2>/dev/null; exit 0',
+            "squeue": f'cat "{_posix(self.tmp)}/squeue.out" 2>/dev/null; exit 0',
+        }
+        for name, body in shims.items():
+            shim = self.shims / name
+            shim.write_text(f"#!/bin/bash\n{body}\n", encoding="utf-8", newline="\n")
+            shim.chmod(0o755)
 
         base = _posix(self.remote)
         config = {
@@ -373,7 +384,77 @@ class ProjectToolTests(unittest.TestCase):
         server.settings = None
         server.backend = None
         server.active_project = server._UNSET
+        server._ledger_cache = None
         self._tmp.cleanup()
+
+    def _fixture(self, name: str, text: str) -> None:
+        (self.tmp / name).write_text(text, encoding="utf-8", newline="\n")
+
+    def _sync_project_repo(self) -> str:
+        repo = self.local / "proj"
+        repo.mkdir()
+        _git(repo, "init", "-q", "-b", "main")
+        (repo / "job.sh").write_text("#!/bin/bash\necho hi\n", encoding="utf-8", newline="\n")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-q", "-m", "job")
+        server.sync_local_commits("proj")
+        return _git(repo, "rev-parse", "HEAD")
+
+    def test_submitted_jobs_are_recorded_and_refreshed(self) -> None:
+        server.project_use("alpha")
+        head = self._sync_project_repo()
+        submitted = server.submit_job("cpu", "job.sh", purpose="baseline run")
+        self.assertEqual(submitted["job_id"], "1001")
+        self.assertEqual(submitted["git_commit"], head)
+        self.assertFalse(submitted["git_dirty"])
+        self.assertNotIn("ledger_error", submitted)
+
+        self._fixture("sacct.out", "1001|1001|job.sh|cpu|def-pi|2|RUNNING|0:0|00:00:30\n")
+        status = server.project_status()
+        local = status["clusters"]["local"]
+        self.assertTrue(local["refreshed"])
+        self.assertEqual(local["unfinished_jobs"][0]["state"], "RUNNING")
+        self.assertEqual(local["unfinished_jobs"][0]["purpose"], "baseline run")
+        self.assertIsNotNone(local["unfinished_jobs"][0]["state_checked_at"])
+        self.assertEqual(local["location"]["commit"], head)
+        self.assertEqual(local["location"]["remote_repo"], _posix(self.remote) + "/projects/alpha")
+        self.assertEqual(local["location"]["run_root"], _posix(self.remote) + "/runs/alpha")
+
+        # squeue rows are tagged with the project that submitted them.
+        self._fixture(
+            "squeue.out",
+            "1001|cpu|job.sh|tester|RUNNING|0:10|10:00|1|2|1G|node1\n555|cpu|other|tester|PENDING|0:00|10:00|1|2|1G|(None)\n",
+        )
+        rows = {row["job_id"]: row for row in server.list_jobs()["jobs"]}
+        self.assertEqual((rows["1001"]["project"], rows["1001"]["tracked"]), ("alpha", True))
+        self.assertFalse(rows["555"]["tracked"])
+
+        self._fixture("sacct.out", "1001|1001|job.sh|cpu|def-pi|2|COMPLETED|0:0|00:05:00\n")
+        server.project_status()
+        again = server.project_status()["clusters"]["local"]
+        self.assertEqual(again["unfinished_jobs"], [])
+        self.assertEqual(again["job_counts"], {"COMPLETED": 1})
+        self.assertEqual(server.project_history(kind="job_finished")["count"], 1)
+        kinds = [event["kind"] for event in server.project_history()["events"]]
+        self.assertEqual(kinds, ["job_finished", "job_submitted", "repo_synced"])
+
+        # Logs are found through the job's recorded project, even with no active project.
+        server.project_use(None)
+        log = self.remote / "runs" / "alpha" / "logs" / "job.sh-1001.out"
+        log.write_text("hello\n", encoding="utf-8", newline="\n")
+        self.assertEqual(server.tail_job_log("1001")["content"], "hello\n")
+        with self.assertRaisesRegex(ValueError, "Recorded projects: alpha"):
+            server.project_status()
+        self.assertEqual(server.project_list()["recorded"][0]["project"], "alpha")
+
+    def test_project_record_failure_does_not_fail_the_tool(self) -> None:
+        server.project_use("alpha")
+        self._sync_project_repo()
+        # A directory is not a usable SQLite file.
+        server._ledger_cache = (server.get_settings(), server.Ledger(self.tmp))
+        submitted = server.submit_job("cpu", "job.sh")
+        self.assertTrue(submitted["submitted"])
+        self.assertIn("Could not update the project record", submitted["ledger_error"])
 
     def test_tools_need_a_project_when_paths_use_it(self) -> None:
         with self.assertRaisesRegex(ValueError, "No project selected"):
@@ -502,6 +583,19 @@ class SlurmToolTests(unittest.TestCase):
         result = server.job_history(days=3)
         self.assertEqual([job["job_id"] for job in result["jobs"]], ["2", "1"])
         self.assertIn("-u", server.backend.calls[0])
+
+    def test_project_record_can_be_disabled(self) -> None:
+        config_path = Path(self._tmp.name) / "no-state.yaml"
+        config_path.write_text(
+            yaml.safe_dump({"state_db": None, "clusters": {"narval": {"host": "narval", "user": "alice"}}}),
+            encoding="utf-8",
+        )
+        server.settings = load_settings(config_path)
+        server.backend = RecordingBackend({})
+        self.assertTrue(server.cancel_job("12345")["ok"])
+        with self.assertRaisesRegex(ValueError, "disabled"):
+            server.project_status()
+        self.assertFalse(list(Path(self._tmp.name).glob("*.sqlite3")))
 
     def test_slurm_accounts_strips_cpu_gpu_suffix(self) -> None:
         rows = "def-pi_cpu|alice|1|0.1|10|0.01|0.9\ndef-pi_gpu|alice|1|0.1|10|0.01|0.9\nrrg-pi_gpu|alice|1|0.1|1|0.0|0.5\n"

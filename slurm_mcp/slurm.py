@@ -21,6 +21,24 @@ SQUEUE_FIELDS = (
 )
 SQUEUE_FORMAT = "%i|%P|%j|%u|%T|%M|%l|%D|%C|%m|%R"
 
+# Job states after which a job no longer changes. MIXED is this module's summary
+# for an array job whose tasks all finished with different states.
+TERMINAL_JOB_STATES = frozenset(
+    {
+        "BOOT_FAIL",
+        "CANCELLED",
+        "COMPLETED",
+        "DEADLINE",
+        "FAILED",
+        "MIXED",
+        "NODE_FAIL",
+        "OUT_OF_MEMORY",
+        "PREEMPTED",
+        "REVOKED",
+        "TIMEOUT",
+    }
+)
+
 SACCT_FIELDS = (
     "job_id_raw",
     "job_id",
@@ -123,6 +141,67 @@ def sacct_argv(job_id: str) -> list[str]:
         "--parsable2",
         "--noheader",
     ]
+
+
+def sacct_jobs_argv(job_ids: list[str]) -> list[str]:
+    """Allocation-level accounting rows (-X) for several jobs in one call."""
+    if not job_ids:
+        raise ValueError("job_ids must not be empty.")
+    return [
+        "sacct",
+        "-X",
+        "-j",
+        ",".join(job_ids),
+        f"--format={SACCT_FORMAT}",
+        "--parsable2",
+        "--noheader",
+    ]
+
+
+def summarize_job_rows(rows: list[dict[str, str]], job_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Fold sacct rows into one state per submitted job id.
+
+    Array jobs report one row per task (123_0, 123_1, 123_[2-9]); they are
+    combined into counts by state. The overall state is the only state if
+    there is one; otherwise RUNNING or PENDING while any task is, another
+    unfinished state if any, or MIXED once every task has finished.
+    """
+    wanted = set(job_ids)
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        row_id = row.get("job_id", "")
+        if "." in row_id:
+            # Job steps (123.batch, 123.extern) repeat the allocation's state.
+            continue
+        base = row_id.split("_", 1)[0]
+        if base in wanted:
+            grouped.setdefault(base, []).append(row)
+
+    summary: dict[str, dict[str, Any]] = {}
+    for job_id, job_rows in grouped.items():
+        states = [(row.get("state") or "").split()[0].rstrip("+").upper() for row in job_rows]
+        counts: dict[str, int] = {}
+        for state in states:
+            counts[state] = counts.get(state, 0) + 1
+        unfinished = [state for state in counts if state not in TERMINAL_JOB_STATES]
+        if len(counts) == 1:
+            overall = states[0]
+        elif "RUNNING" in counts:
+            overall = "RUNNING"
+        elif "PENDING" in counts:
+            overall = "PENDING"
+        elif unfinished:
+            overall = unfinished[0]
+        else:
+            overall = "MIXED"
+        first = job_rows[0]
+        summary[job_id] = {
+            "state": overall,
+            "exit_code": first.get("exit_code") if len(job_rows) == 1 else None,
+            "elapsed": first.get("elapsed") if len(job_rows) == 1 else None,
+            "array_tasks": counts if len(job_rows) > 1 else None,
+        }
+    return summary
 
 
 def sacct_user_argv(user: str, start: str) -> list[str]:

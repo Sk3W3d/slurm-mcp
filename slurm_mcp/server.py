@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
+import sqlite3
 import tempfile
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable
 
 import anyio
 from mcp.server.fastmcp import FastMCP
@@ -16,6 +17,8 @@ from . import python_env
 from . import remote_tasks
 from .audit import preview_text, write_audit_event
 from .config import Cluster, NeedsProject, Settings, expand_template, load_settings, validate_project_name
+from .ledger import Ledger
+from .ledger import now as ledger_now
 from .local_files import check_transfer_size, local_git_ok, resolve_local_path, run_local_git
 from .remote_files import (
     REQUIRED_ROOT_KEYS,
@@ -66,6 +69,7 @@ from .slurm import (
     parse_squeue,
     parse_sshare,
     sacct_argv,
+    sacct_jobs_argv,
     sacct_user_argv,
     scancel_argv,
     sinfo_argv,
@@ -73,6 +77,7 @@ from .slurm import (
     squeue_job_argv,
     sshare_argv,
     submit_accounts,
+    summarize_job_rows,
 )
 from .ssh import CommandResult, OpenSSHBackend, SSHBackend, argv_in_dir
 from .validators import (
@@ -103,6 +108,44 @@ def get_active_project() -> str | None:
     if active_project is _UNSET:
         return get_settings().default_project
     return active_project
+
+
+_ledger_cache: tuple[Settings, Ledger | None] | None = None
+
+
+def get_ledger() -> Ledger | None:
+    """The project record for the current settings, or None when state_db is disabled."""
+    global _ledger_cache
+    current = get_settings()
+    if _ledger_cache is None or _ledger_cache[0] is not current:
+        path = current.state_db_path()
+        _ledger_cache = (current, Ledger(path) if path else None)
+    return _ledger_cache[1]
+
+
+_LEDGER_ERRORS = (sqlite3.Error, OSError, ValueError, TypeError)
+
+
+def _record(action: Callable[[Ledger], Any]) -> dict[str, object]:
+    """Write to the project record. A failure never fails the tool; it is reported instead."""
+    ledger = get_ledger()
+    if ledger is None:
+        return {}
+    try:
+        action(ledger)
+    except _LEDGER_ERRORS as exc:
+        return {"ledger_error": f"Could not update the project record: {type(exc).__name__}: {exc}"}
+    return {}
+
+
+def _ledger_read(action: Callable[[Ledger], Any], default: Any) -> Any:
+    ledger = get_ledger()
+    if ledger is None:
+        return default
+    try:
+        return action(ledger)
+    except _LEDGER_ERRORS:
+        return default
 
 
 def get_backend() -> SSHBackend:
@@ -207,6 +250,8 @@ def project_list(cluster: str | None = None) -> dict[str, object]:
             {"name": spec.name, "description": spec.description, "clusters_with_overrides": sorted(spec.clusters or {})}
             for spec in sorted(current_settings.projects.values(), key=lambda spec: spec.name)
         ],
+        # Projects with activity in the local record, most recent first.
+        "recorded": _ledger_read(lambda ledger: ledger.projects(), []),
     }
     if cluster is None:
         return result
@@ -233,6 +278,174 @@ def project_list(cluster: str | None = None) -> dict[str, object]:
             found.append({"name": name, "git": kind == "git", "configured": name in current_settings.projects})
     result["found"] = found
     return result
+
+
+def _status_project(project: str | None) -> str | None:
+    """Project for the record tools: the given one, else the active one.
+
+    With neither, records without a project are shown, unless projects have
+    been recorded, in which case the caller must say which one.
+    """
+    if project:
+        return validate_project_name(project)
+    active = get_active_project()
+    if active is not None:
+        return active
+    recorded = _ledger_read(lambda ledger: [row["project"] for row in ledger.projects()], [])
+    if recorded:
+        raise ValueError(
+            f"No project selected. Pass project=... or call project_use. Recorded projects: {', '.join(recorded)}."
+        )
+    return None
+
+
+def _require_ledger() -> Ledger:
+    ledger = get_ledger()
+    if ledger is None:
+        raise ValueError("The project record is disabled (state_db: null in config.yaml).")
+    return ledger
+
+
+_SACCT_BATCH = 100
+
+
+def _refresh_cluster(settings: Settings, ledger: Ledger, target: Cluster, project: str | None) -> dict[str, object]:
+    """Update cached states of unfinished jobs and tasks from the cluster, if it is connected."""
+    outcome: dict[str, object] = {"connected": False, "refreshed": False}
+    try:
+        outcome["connected"] = get_backend().check(target.host).returncode == 0
+    except Exception as exc:
+        outcome["connection_error"] = repr(exc)
+    if not outcome["connected"]:
+        return outcome
+
+    errors: list[str] = []
+    job_ids = [job["job_id"] for job in ledger.jobs(project=project, cluster=target.name, active_only=True, limit=1000)]
+    for start in range(0, len(job_ids), _SACCT_BATCH):
+        chunk = job_ids[start : start + _SACCT_BATCH]
+        try:
+            result = _run_remote_result(settings, target, sacct_jobs_argv(chunk), tool="project_status", timeout=60)
+        except Exception as exc:
+            errors.append(f"sacct: {exc!r}")
+            break
+        if result.returncode != 0:
+            errors.append(f"sacct: {_command_error(result.returncode, result.stderr)}")
+            continue
+        ledger.update_job_states(target.name, summarize_job_rows(parse_sacct(result.stdout), chunk))
+
+    for task in ledger.tasks(project=project, cluster=target.name, active_only=True, limit=10):
+        details = task.get("details") if isinstance(task.get("details"), dict) else {}
+        directory = details.get("task_dir")
+        if not directory:
+            continue
+        try:
+            output = _run_remote_output(
+                settings, target, remote_tasks.task_status_argv(directory, 1), tool="project_status", timeout=30, strip=False
+            )
+        except Exception as exc:
+            errors.append(f"task {task['task_id']}: {exc!r}")
+            continue
+        status = remote_tasks.parse_task_status(output)
+        ledger.update_task_state(target.name, task["task_id"], status["state"], status.get("exit_code"))
+
+    outcome["refreshed"] = True
+    if errors:
+        outcome["refresh_errors"] = errors
+    return outcome
+
+
+_TASK_VIEW_FIELDS = ("task_id", "kind", "description", "started_at", "state", "exit_code", "state_checked_at")
+
+
+@mcp.tool()
+def project_status(
+    project: str | None = None,
+    cluster: str | None = None,
+    refresh: bool = True,
+    job_limit: int = 20,
+) -> dict[str, object]:
+    """Where a project lives on each cluster, its recent and unfinished jobs, background tasks, and latest events.
+
+    Everything comes from the local project record, which the server fills in
+    as it submits jobs, syncs code, and builds venvs. With refresh=True, the
+    states of unfinished jobs (sacct) and tasks are re-read from every
+    connected cluster first; other clusters show their last known state, with
+    state_checked_at saying how old it is. Defaults to the active project.
+    """
+    current_settings = get_settings()
+    ledger = _require_ledger()
+    name = _status_project(project)
+    safe_limit = validate_limit(job_limit)
+    if cluster is not None:
+        clusters = [current_settings.get_cluster(cluster).name]
+    else:
+        clusters = [c for c in ledger.clusters_for(name) if c in current_settings.clusters]
+    locations = ledger.locations(name) if name else {}
+
+    per_cluster: dict[str, object] = {}
+    for cluster_name in clusters:
+        target = current_settings.get_cluster(cluster_name)
+        refreshed = (
+            _refresh_cluster(current_settings, ledger, target, name)
+            if refresh
+            else {"connected": None, "refreshed": False}
+        )
+        jobs = ledger.jobs(project=name, cluster=cluster_name, limit=safe_limit)
+        unfinished = ledger.jobs(project=name, cluster=cluster_name, active_only=True, limit=safe_limit)
+        tasks = ledger.tasks(project=name, cluster=cluster_name, limit=5)
+        per_cluster[cluster_name] = {
+            **refreshed,
+            "location": locations.get(cluster_name),
+            "job_counts": ledger.job_state_counts(project=name, cluster=cluster_name),
+            "unfinished_jobs": [_job_view(job) for job in unfinished],
+            "recent_jobs": [_job_view(job) for job in jobs],
+            "recent_tasks": [{key: task.get(key) for key in _TASK_VIEW_FIELDS} for task in tasks],
+        }
+
+    result: dict[str, object] = {
+        "project": name,
+        "active_project": get_active_project(),
+        "clusters": per_cluster,
+        "recent_events": _event_views(ledger.events(project=name, limit=10)),
+        "state_db": str(ledger.path),
+    }
+    if not clusters:
+        result["note"] = (
+            f"Nothing recorded yet for project '{name}'. Jobs, syncs, and venv builds done through this server are "
+            "recorded automatically."
+            if name
+            else "Nothing recorded yet."
+        )
+    return result
+
+
+@mcp.tool()
+def project_history(
+    project: str | None = None,
+    cluster: str | None = None,
+    kind: str | None = None,
+    limit: int = 50,
+) -> dict[str, object]:
+    """Timeline of what happened in a project, newest first.
+
+    Events are recorded automatically: job_submitted, job_finished,
+    job_cancel_requested, repo_cloned, repo_pulled, repo_checkout,
+    repo_synced, task_started, task_finished. Filter with kind or cluster.
+    Defaults to the active project.
+    """
+    current_settings = get_settings()
+    ledger = _require_ledger()
+    name = _status_project(project)
+    cluster_name = current_settings.get_cluster(cluster).name if cluster else None
+    events = ledger.events(project=name, cluster=cluster_name, kind=kind or None, limit=validate_limit(limit))
+    return {"project": name, "count": len(events), "events": _event_views(events)}
+
+
+def _event_views(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {key: event.get(key) for key in ("ts", "cluster", "kind", "summary", "data")}
+        for event in events
+    ]
 
 
 _PROBE_PROJECT = "slurm-mcp-probe"
@@ -375,6 +588,7 @@ def list_jobs(cluster: str | None = None, states: str | None = None) -> dict[str
         timeout=30,
     )
     jobs = parse_squeue(output)
+    tracking = _track_jobs(target, jobs)
     return {
         "cluster": target.name,
         "host": target.host,
@@ -382,6 +596,7 @@ def list_jobs(cluster: str | None = None, states: str | None = None) -> dict[str
         "states": safe_states,
         "count": len(jobs),
         "jobs": jobs,
+        **tracking,
     }
 
 
@@ -409,15 +624,20 @@ def job_status(job_id: str, cluster: str | None = None) -> dict[str, object]:
 
     queue = parse_squeue(queue_result.stdout) if queue_result.returncode == 0 else []
     accounting = parse_sacct(accounting_result.stdout) if accounting_result.returncode == 0 else []
+    # Accounting has the full picture; a job submitted seconds ago may only be in the queue.
+    tracking = _track_jobs(target, accounting or queue)
+    record = _ledger_read(lambda ledger: ledger.get_job(target.name, _base_job_id(safe_job_id)), None)
     return {
         "cluster": target.name,
         "host": target.host,
         "job_id": safe_job_id,
         "summary": _job_summary(queue, accounting),
+        "record": _job_view(record) if record else None,
         "queue": queue,
         "accounting": accounting,
         "queue_error": _command_error(queue_result.returncode, queue_result.stderr),
         "accounting_error": _command_error(accounting_result.returncode, accounting_result.stderr),
+        **tracking,
     }
 
 
@@ -432,8 +652,13 @@ def submit_job(
     env: dict[str, str] | None = None,
     dry_run: bool = False,
     project: str | None = None,
+    purpose: str | None = None,
 ) -> dict[str, object]:
     """Submit a Slurm job using a configured profile and a script under the project's remote_repo.
+
+    purpose is a short note on why the job runs (for example "baseline, lr=3e-4");
+    it is kept in the project record with the job id, profile, and the commit
+    the repo was at, and shows up in project_status.
 
     overrides replaces profile keys for this submission only (for example
     {"time": "02:00:00", "gpus": 2, "array": "0-9", "dependency": "afterok:123"}).
@@ -467,6 +692,7 @@ def submit_job(
     )
     safe_script = validate_remote_relative_path(script, "script")
     safe_job_name = validate_job_name(job_name) if job_name else None
+    safe_purpose = _validate_note(purpose, "purpose", 500)
     safe_script_args = validate_argument_list(script_args, "script_args")
     job_env = _job_env(info, profile_data.get("env"), env)
 
@@ -527,13 +753,60 @@ def submit_job(
         timeout=30,
     )
     job_id = parse_sbatch_job_id(stdout)
+    expected_stdout = f"{log_dir}/%x-{job_id}.out" if log_dir else None
+    expected_stderr = f"{log_dir}/%x-{job_id}.err" if log_dir else None
+    commit, dirty = _repo_snapshot(current_settings, target, remote_repo, tool="submit_job")
+    recorded_name = safe_job_name or PurePosixPath(safe_script).name
+
+    def write(ledger: Ledger) -> None:
+        ledger.add_job(
+            cluster=target.name,
+            job_id=job_id,
+            project=roots.project,
+            job_name=recorded_name,
+            profile=profile,
+            script=safe_script,
+            purpose=safe_purpose,
+            git_commit=commit,
+            git_dirty=dirty,
+            details={
+                "script_args": safe_script_args,
+                "overrides": overrides or {},
+                "env": env or {},
+                "expected_stdout": expected_stdout,
+                "expected_stderr": expected_stderr,
+            },
+        )
+        commit_note = f" at {commit[:12]}{' (dirty)' if dirty else ''}" if commit else ""
+        ledger.add_event(
+            "job_submitted",
+            f"Job {job_id} submitted: {safe_script} with profile {profile}{commit_note}"
+            + (f". Purpose: {safe_purpose}" if safe_purpose else ""),
+            project=roots.project,
+            cluster=target.name,
+            data={"job_id": job_id, "profile": profile, "script": safe_script, "commit": commit, "dirty": dirty},
+        )
+        if roots.project:
+            ledger.update_location(
+                roots.project,
+                target.name,
+                remote_repo=remote_repo,
+                run_root=run_root,
+                commit=commit,
+                commit_source="job_submitted" if commit else None,
+                commit_seen_at=ledger_now() if commit else None,
+            )
+
     return {
         **preview,
         "submitted": True,
         "job_id": job_id,
         "stdout": stdout,
-        "expected_stdout": f"{log_dir}/%x-{job_id}.out" if log_dir else None,
-        "expected_stderr": f"{log_dir}/%x-{job_id}.err" if log_dir else None,
+        "expected_stdout": expected_stdout,
+        "expected_stderr": expected_stderr,
+        "git_commit": commit,
+        "git_dirty": dirty,
+        **_record(write),
     }
 
 
@@ -551,6 +824,19 @@ def cancel_job(job_id: str, cluster: str | None = None) -> dict[str, object]:
         tool="cancel_job",
         timeout=30,
     )
+    recorded: dict[str, object] = {}
+    if result.returncode == 0:
+        record = _ledger_read(lambda ledger: ledger.get_job(target.name, _base_job_id(safe_job_id)), None)
+        if record is not None:
+            recorded = _record(
+                lambda ledger: ledger.add_event(
+                    "job_cancel_requested",
+                    f"Cancel requested for job {safe_job_id} ({record.get('job_name') or 'unnamed'})",
+                    project=record.get("project"),
+                    cluster=target.name,
+                    data={"job_id": safe_job_id},
+                )
+            )
     return {
         "cluster": target.name,
         "host": target.host,
@@ -558,6 +844,7 @@ def cancel_job(job_id: str, cluster: str | None = None) -> dict[str, object]:
         "ok": result.returncode == 0,
         "stdout": result.stdout.strip(),
         "error": _command_error(result.returncode, result.stderr),
+        **recorded,
     }
 
 
@@ -580,6 +867,7 @@ def job_history(cluster: str | None = None, days: int = 7, limit: int = 100) -> 
     )
     jobs = parse_sacct(output)
     jobs.reverse()
+    tracking = _track_jobs(target, jobs)
     return {
         "cluster": target.name,
         "host": target.host,
@@ -588,6 +876,7 @@ def job_history(cluster: str | None = None, days: int = 7, limit: int = 100) -> 
         "count": min(len(jobs), safe_limit),
         "total": len(jobs),
         "jobs": jobs[:safe_limit],
+        **tracking,
     }
 
 
@@ -778,10 +1067,15 @@ def job_logs(
     limit: int = 20,
     project: str | None = None,
 ) -> dict[str, object]:
-    """Find stdout/stderr log files for a Slurm job under the project's run_root."""
+    """Find stdout/stderr log files for a Slurm job under the project's run_root.
+
+    For jobs submitted through this server, the job's own project is used
+    when project is not given.
+    """
     current_settings = get_settings()
-    target, roots = _file_context(current_settings, cluster, project)
     safe_job_id = validate_job_id(job_id)
+    project = project or _recorded_job_project(current_settings, cluster, safe_job_id)
+    target, roots = _file_context(current_settings, cluster, project)
     safe_limit = validate_limit(limit)
     files = _job_log_files(current_settings, target, roots, safe_job_id, safe_limit)
     return {
@@ -801,10 +1095,11 @@ def tail_job_log(
     lines: int = 100,
     project: str | None = None,
 ) -> dict[str, object]:
-    """Tail the stdout or stderr log file for a Slurm job."""
+    """Tail the stdout or stderr log file for a Slurm job (uses the job's recorded project by default)."""
     current_settings = get_settings()
-    target, roots = _file_context(current_settings, cluster, project)
     safe_job_id = validate_job_id(job_id)
+    project = project or _recorded_job_project(current_settings, cluster, safe_job_id)
+    target, roots = _file_context(current_settings, cluster, project)
     safe_lines = validate_line_count(lines)
     files = _job_log_files(current_settings, target, roots, safe_job_id, limit=20)
     selected = select_job_log(files, stream)
@@ -1160,7 +1455,7 @@ def cluster_preflight(
 def remote_git_status(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Return structured Git status for the project's remote repository."""
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster, project)
+    target, remote_repo, repo_project = _repo_context(current_settings, cluster, project)
     output = _run_remote_output(
         current_settings,
         target,
@@ -1181,7 +1476,7 @@ def remote_git_status(cluster: str | None = None, project: str | None = None) ->
 def remote_git_rev(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Return the current full and short Git commit for the project's remote repository."""
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster, project)
+    target, remote_repo, repo_project = _repo_context(current_settings, cluster, project)
     full = _run_remote_output(
         current_settings,
         target,
@@ -1209,7 +1504,7 @@ def remote_git_rev(cluster: str | None = None, project: str | None = None) -> di
 def remote_git_branch(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Return the current Git branch for the project's remote repository."""
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster, project)
+    target, remote_repo, repo_project = _repo_context(current_settings, cluster, project)
     branch = _run_remote_output(
         current_settings,
         target,
@@ -1234,7 +1529,7 @@ def remote_git_pull(
 ) -> dict[str, object]:
     """Dry-run or perform a fast-forward-only Git pull in the project's remote repository."""
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster, project)
+    target, remote_repo, repo_project = _repo_context(current_settings, cluster, project)
     before_status_output = _run_remote_output(
         current_settings,
         target,
@@ -1301,6 +1596,9 @@ def remote_git_pull(
         tool="remote_git_pull",
         timeout=30,
     )
+    after_status = parse_git_status(after_status_output)
+    changed = before_rev != after_rev
+    summary = f"Pulled {before_rev[:12]} -> {after_rev[:12]}" if changed else f"Pull: already at {after_rev[:12]}"
     return {
         "cluster": target.name,
         "host": target.host,
@@ -1311,9 +1609,19 @@ def remote_git_pull(
         "stderr": pull_result.stderr,
         "before_commit": before_rev,
         "after_commit": after_rev,
-        "changed": before_rev != after_rev,
+        "changed": changed,
         "before_status": before_status,
-        "after_status": parse_git_status(after_status_output),
+        "after_status": after_status,
+        **_record_repo(
+            target,
+            repo_project,
+            remote_repo,
+            "repo_pulled",
+            summary,
+            commit=after_rev,
+            branch=after_status.get("branch"),
+            data={"before_commit": before_rev},
+        ),
     }
 
 
@@ -1321,7 +1629,7 @@ def remote_git_pull(
 def remote_git_fetch(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Fetch (git fetch --prune) in the remote repository without touching the working tree."""
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster, project)
+    target, remote_repo, repo_project = _repo_context(current_settings, cluster, project)
     result = _run_remote_result(
         current_settings, target, git_fetch_argv(remote_repo), tool="remote_git_fetch", timeout=300
     )
@@ -1339,7 +1647,7 @@ def remote_git_fetch(cluster: str | None = None, project: str | None = None) -> 
 def remote_git_checkout(ref: str, cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Check out a branch, tag, or commit in the remote repository (refuses if it has uncommitted changes)."""
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster, project)
+    target, remote_repo, repo_project = _repo_context(current_settings, cluster, project)
     safe_ref = validate_git_ref(ref)
     status = _remote_git_status(current_settings, target, remote_repo, "remote_git_checkout")
     if not status["clean"]:
@@ -1349,15 +1657,25 @@ def remote_git_checkout(ref: str, cluster: str | None = None, project: str | Non
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "remote git checkout failed")
+    commit = _run_remote_output(current_settings, target, git_rev_argv(remote_repo), tool="remote_git_checkout", timeout=30)
+    branch = _run_remote_output(current_settings, target, git_branch_argv(remote_repo), tool="remote_git_checkout", timeout=30)
     return {
         "cluster": target.name,
         "host": target.host,
         "remote_repo": remote_repo,
         "ref": safe_ref,
-        "commit": _run_remote_output(
-            current_settings, target, git_rev_argv(remote_repo), tool="remote_git_checkout", timeout=30
-        ),
+        "commit": commit,
         "stderr": result.stderr.strip(),
+        **_record_repo(
+            target,
+            repo_project,
+            remote_repo,
+            "repo_checkout",
+            f"Checked out {safe_ref} ({commit[:12]})",
+            commit=commit,
+            branch=branch or None,
+            data={"ref": safe_ref},
+        ),
     }
 
 
@@ -1376,7 +1694,7 @@ def remote_git_clone(
     URL for which the cluster account has a deploy key.
     """
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster, project)
+    target, remote_repo, repo_project = _repo_context(current_settings, cluster, project)
     argv = git_clone_argv(url, remote_repo, branch)
     exists = _run_remote_result(
         current_settings, target, ["test", "-e", remote_repo], tool="remote_git_clone", timeout=15
@@ -1389,14 +1707,26 @@ def remote_git_clone(
     result = _run_remote_result(current_settings, target, argv, tool="remote_git_clone", timeout=900)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "remote git clone failed")
+    commit = _run_remote_output(current_settings, target, git_rev_argv(remote_repo), tool="remote_git_clone", timeout=30)
+    current_branch = _run_remote_output(
+        current_settings, target, git_branch_argv(remote_repo), tool="remote_git_clone", timeout=30
+    )
     return {
         "cluster": target.name,
         "host": target.host,
         "remote_repo": remote_repo,
-        "commit": _run_remote_output(
-            current_settings, target, git_rev_argv(remote_repo), tool="remote_git_clone", timeout=30
-        ),
+        "commit": commit,
         "stderr": result.stderr.strip(),
+        **_record_repo(
+            target,
+            repo_project,
+            remote_repo,
+            "repo_cloned",
+            f"Cloned {url} ({commit[:12]})",
+            commit=commit,
+            branch=current_branch or None,
+            data={"url": url},
+        ),
     }
 
 
@@ -1418,7 +1748,7 @@ def sync_local_commits(
     remote branch has diverged, it fails instead of overwriting.
     """
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster, project)
+    target, remote_repo, repo_project = _repo_context(current_settings, cluster, project)
     repo = resolve_local_path(local_repo, current_settings.local_root_paths(), label="local_repo")
     repo = Path(run_local_git(repo, ["rev-parse", "--show-toplevel"]))
     safe_branch = validate_git_ref(branch or run_local_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "branch")
@@ -1520,11 +1850,28 @@ def sync_local_commits(
         )
         checked_out = True
 
+    after = _remote_rev(current_settings, target, remote_repo, f"refs/heads/{safe_branch}")
+    up_to_date = remote_branch_commit == local_commit
+    summary = (
+        f"Synced {safe_branch}: already at {local_commit[:12]}"
+        if up_to_date
+        else f"Synced local {safe_branch} to {(after or local_commit)[:12]}"
+    ) + (" (local uncommitted changes not sent)" if local_dirty else "")
     return {
         **base,
-        "remote_commit_after": _remote_rev(current_settings, target, remote_repo, f"refs/heads/{safe_branch}"),
-        "already_up_to_date": remote_branch_commit == local_commit,
+        "remote_commit_after": after,
+        "already_up_to_date": up_to_date,
         "checked_out": checked_out,
+        **_record_repo(
+            target,
+            repo_project,
+            remote_repo,
+            "repo_synced",
+            summary,
+            commit=after if checked_out else None,
+            branch=safe_branch if checked_out else None,
+            data={"local_repo": str(repo), "branch": safe_branch, "local_dirty": local_dirty},
+        ),
     }
 
 
@@ -1567,7 +1914,14 @@ def setup_venv(
         no_index=no_index,
         recreate=recreate,
     )
-    task = _launch_task(current_settings, target, storage, "venv", body, f"setup_venv {venv}")
+    task = _launch_task(
+        current_settings, target, storage, "venv", body, f"setup_venv {venv}", {"venv": venv, "modules": modules}
+    )
+    if storage.project:
+        location = _record(
+            lambda ledger: ledger.update_location(storage.project, target.name, venv=venv, venv_modules=modules)
+        )
+        task.update(location)
     return {
         **task,
         "venv": venv,
@@ -1655,7 +2009,9 @@ def hf_download(
         ignore_patterns=ignore_patterns,
     )
     description = f"hf_download {repo_type} {repo_id}" + (f"@{revision}" if revision else "")
-    task = _launch_task(current_settings, target, storage, "hf", body, description)
+    task = _launch_task(
+        current_settings, target, storage, "hf", body, description, {"repo_id": repo_id, "repo_type": repo_type}
+    )
     return {**task, "hf_home": hf_home, "repo_id": repo_id, "repo_type": repo_type}
 
 
@@ -1773,12 +2129,19 @@ def remote_task_status(
         timeout=30,
         strip=False,
     )
+    status = remote_tasks.parse_task_status(output)
+    tracking: dict[str, object] = {}
+    if status["state"] != "missing":
+        tracking = _record(
+            lambda ledger: ledger.update_task_state(target.name, task_id, status["state"], status.get("exit_code"))
+        )
     return {
         "cluster": target.name,
         "host": target.host,
         "task_id": task_id,
         "task_dir": directory,
-        **remote_tasks.parse_task_status(output),
+        **status,
+        **tracking,
     }
 
 
@@ -1796,7 +2159,14 @@ def list_remote_tasks(cluster: str | None = None, limit: int = 20, project: str 
         strip=False,
     )
     tasks = remote_tasks.parse_task_list(output)
-    return {"cluster": target.name, "host": target.host, "tasks": tasks[: validate_limit(limit)]}
+
+    def write(ledger: Ledger) -> None:
+        for task in tasks:
+            if task["exit_code"] is not None:
+                ledger.update_task_state(target.name, task["task_id"], task["state"], task["exit_code"])
+
+    tracking = _record(write)
+    return {"cluster": target.name, "host": target.host, "tasks": tasks[: validate_limit(limit)], **tracking}
 
 
 @mcp.tool()
@@ -1870,6 +2240,63 @@ def main() -> None:
     settings = load_settings(args.config)
     backend = make_backend(settings)
     mcp.run()
+
+
+def _recorded_job_project(settings: Settings, cluster: str | None, job_id: str) -> str | None:
+    target = settings.get_cluster(cluster)
+    record = _ledger_read(lambda ledger: ledger.get_job(target.name, _base_job_id(job_id)), None)
+    return record.get("project") if record else None
+
+
+def _base_job_id(job_id: str) -> str:
+    return job_id.split("_", 1)[0].split(".", 1)[0]
+
+
+def _track_jobs(target: Cluster, rows: list[dict[str, Any]]) -> dict[str, object]:
+    """Cache the states seen in squeue/sacct rows and tag each row with its recorded project.
+
+    Rows of jobs this server did not submit get tracked=False and are not stored.
+    """
+    if get_ledger() is None or not rows:
+        return {}
+    base_ids = sorted({_base_job_id(str(row.get("job_id", ""))) for row in rows} - {""})
+    projects = _ledger_read(lambda ledger: ledger.job_projects(target.name, base_ids), {})
+    outcome: dict[str, object] = {}
+    if projects:
+        states = summarize_job_rows(rows, sorted(projects))
+        outcome = _record(lambda ledger: ledger.update_job_states(target.name, states))
+    for row in rows:
+        base = _base_job_id(str(row.get("job_id", "")))
+        row["tracked"] = base in projects
+        row["project"] = projects.get(base)
+    return outcome
+
+
+_JOB_VIEW_FIELDS = (
+    "cluster",
+    "job_id",
+    "project",
+    "job_name",
+    "profile",
+    "script",
+    "purpose",
+    "git_commit",
+    "git_dirty",
+    "submitted_at",
+    "state",
+    "exit_code",
+    "elapsed",
+    "state_checked_at",
+)
+
+
+def _job_view(row: dict[str, Any]) -> dict[str, Any]:
+    view = {key: row.get(key) for key in _JOB_VIEW_FIELDS}
+    details = row.get("details") if isinstance(row.get("details"), dict) else {}
+    view["finished"] = bool(row.get("terminal"))
+    view["expected_stdout"] = details.get("expected_stdout")
+    view["expected_stderr"] = details.get("expected_stderr")
+    return view
 
 
 def _remote_user(settings: Settings, target: Cluster, tool: str) -> str:
@@ -1960,12 +2387,50 @@ def _file_context(
     return target, _roots(settings, target, info, require_project=require_project)
 
 
-def _repo_context(settings: Settings, cluster: str | None, project: str | None = None) -> tuple[Cluster, str]:
+def _repo_context(
+    settings: Settings, cluster: str | None, project: str | None = None
+) -> tuple[Cluster, str, str | None]:
+    """Cluster, remote_repo path, and the project it belongs to (None without projects)."""
     target, roots = _file_context(settings, cluster, project)
     remote_repo = roots.get("remote_repo")
     if not remote_repo:
         raise ValueError("Cluster must define storage.remote_repo before remote Git tools can be used.")
-    return target, remote_repo
+    return target, remote_repo, roots.project
+
+
+def _record_repo(
+    target: Cluster,
+    project: str | None,
+    remote_repo: str,
+    kind: str,
+    summary: str,
+    *,
+    commit: str | None,
+    branch: str | None = None,
+    data: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    """Log a change to the remote checkout and remember its commit for the project."""
+
+    def write(ledger: Ledger) -> None:
+        ledger.add_event(
+            kind,
+            summary,
+            project=project,
+            cluster=target.name,
+            data={"remote_repo": remote_repo, "commit": commit, "branch": branch, **(data or {})},
+        )
+        if project:
+            ledger.update_location(
+                project,
+                target.name,
+                remote_repo=remote_repo,
+                commit=commit,
+                branch=branch,
+                commit_source=kind,
+                commit_seen_at=ledger_now(),
+            )
+
+    return _record(write)
 
 
 def _env_context(
@@ -2050,6 +2515,39 @@ def _remote_git_status(settings: Settings, target: Cluster, remote_repo: str, to
     return parse_git_status(output)
 
 
+_REPO_SNAPSHOT_SCRIPT = (
+    'c=$(git -C "$1" rev-parse --verify --quiet HEAD 2>/dev/null) || exit 0; '
+    'echo "$c"; git -C "$1" status --porcelain 2>/dev/null | head -n 1'
+)
+
+
+def _repo_snapshot(settings: Settings, target: Cluster, remote_repo: str, *, tool: str) -> tuple[str | None, bool | None]:
+    """Commit the remote repo is at and whether it has uncommitted changes; (None, None) if not a Git repo."""
+    try:
+        result = _run_remote_result(
+            settings, target, ["bash", "-c", _REPO_SNAPSHOT_SCRIPT, "_", remote_repo], tool=tool, timeout=30
+        )
+    except Exception:
+        return None, None
+    lines = result.stdout.splitlines()
+    if result.returncode != 0 or not lines or not lines[0].strip():
+        return None, None
+    return lines[0].strip(), len(lines) > 1 and bool(lines[1].strip())
+
+
+def _validate_note(value: str | None, label: str, max_chars: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string.")
+    value = value.strip()
+    if "\x00" in value:
+        raise ValueError(f"{label} cannot contain NUL characters.")
+    if len(value) > max_chars:
+        raise ValueError(f"{label} must be at most {max_chars} characters.")
+    return value or None
+
+
 def _remote_rev(settings: Settings, target: Cluster, remote_repo: str, ref: str) -> str | None:
     result = _run_remote_result(
         settings,
@@ -2069,6 +2567,7 @@ def _launch_task(
     kind: str,
     body: str,
     description: str,
+    details: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     task_id = remote_tasks.new_task_id(kind)
     directory = _task_dir(storage, task_id)
@@ -2083,6 +2582,24 @@ def _launch_task(
         input_data=script.encode("utf-8"),
     )
     pid = _run_remote_output(settings, target, remote_tasks.launch_task_argv(script_path), tool=f"task:{kind}", timeout=30)
+
+    def write(ledger: Ledger) -> None:
+        ledger.add_task(
+            cluster=target.name,
+            task_id=task_id,
+            project=storage.project,
+            kind=kind,
+            description=description,
+            details={"task_dir": directory, **(details or {})},
+        )
+        ledger.add_event(
+            "task_started",
+            f"Started {description} (task {task_id})",
+            project=storage.project,
+            cluster=target.name,
+            data={"task_id": task_id, "kind": kind, **(details or {})},
+        )
+
     return {
         "cluster": target.name,
         "host": target.host,
@@ -2091,6 +2608,7 @@ def _launch_task(
         "pid": pid,
         "description": description,
         "next_step": f"Poll remote_task_status(task_id='{task_id}') until state is succeeded or failed.",
+        **_record(write),
     }
 
 

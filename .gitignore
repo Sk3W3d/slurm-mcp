@@ -7,3 +7,4 @@ config.yaml
 .slurm-mcp-audit.jsonl
 *.egg-info/
 slurm-mcp-downloads/
+.slurm-mcp-state.sqlite3*
