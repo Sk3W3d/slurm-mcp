@@ -361,6 +361,7 @@ class ProjectToolTests(unittest.TestCase):
                     "venv_root": base + "/venvs",
                     "hf_home": base + "/hf",
                     "tasks_root": base + "/tasks",
+                    "record_root": base + "/records",
                 },
             },
             "clusters": {
@@ -446,6 +447,60 @@ class ProjectToolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Recorded projects: alpha"):
             server.project_status()
         self.assertEqual(server.project_list()["recorded"][0]["project"], "alpha")
+
+    def test_notes_show_in_status_and_history(self) -> None:
+        server.project_use("alpha")
+        note = server.project_note("val acc 71.2% at epoch 12", category="result", job_ids=["1001"])
+        self.assertEqual((note["category"], note["job_ids"]), ("result", ["1001"]))
+        server.project_note("try lr=1e-4 next", category="next_step")
+        status = server.project_status()
+        self.assertEqual(
+            [(n["category"], n["text"]) for n in status["recent_notes"]],
+            [("next_step", "try lr=1e-4 next"), ("result", "val acc 71.2% at epoch 12")],
+        )
+        self.assertNotIn("note", status)  # notes count as recorded activity
+        self.assertEqual(status["recent_events"], [])
+        self.assertEqual(server.project_history(kind="note")["count"], 2)
+        with self.assertRaisesRegex(ValueError, "category"):
+            server.project_note("x", category="gossip")
+        with self.assertRaisesRegex(ValueError, "empty"):
+            server.project_note("   ")
+        server.project_use(None)
+        with self.assertRaisesRegex(ValueError, "project"):
+            server.project_note("orphan")
+
+    def test_record_sync_between_two_machines(self) -> None:
+        settings = server.get_settings()
+        laptop = server.Ledger(self.tmp / "laptop.sqlite3")
+        desktop = server.Ledger(self.tmp / "desktop.sqlite3")
+
+        server._ledger_cache = (settings, laptop)
+        server.project_note("from laptop", project="alpha")
+        first = server.project_record_sync(project="alpha")
+        self.assertFalse(first["remote_copy_existed"])
+        self.assertEqual(first["path"], _posix(self.remote) + "/records/alpha.json")
+        self.assertTrue((self.remote / "records" / "alpha.json").is_file())
+
+        server._ledger_cache = (settings, desktop)
+        pulled = server.project_record_sync(project="alpha")
+        self.assertEqual(pulled["merged_from_cluster"]["events"], 1)
+        server.project_note("from desktop", project="alpha")
+        server.project_record_sync(project="alpha")
+
+        server._ledger_cache = (settings, laptop)
+        back = server.project_record_sync(project="alpha")
+        self.assertEqual(back["merged_from_cluster"]["events"], 1)
+        texts = [n["text"] for n in server.project_status(project="alpha", refresh=False)["recent_notes"]]
+        self.assertEqual(sorted(texts), ["from desktop", "from laptop"])
+        self.assertEqual(server.project_record_sync(project="alpha")["merged_from_cluster"]["events"], 0)
+
+        (self.remote / "records" / "alpha.json").write_text("{not json", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "not valid JSON"):
+            server.project_record_sync(project="alpha")
+
+    def test_server_instructions_are_published(self) -> None:
+        self.assertIn("project_status", server.mcp.instructions)
+        self.assertIn("project_note", server.mcp.instructions)
 
     def test_project_record_failure_does_not_fail_the_tool(self) -> None:
         server.project_use("alpha")

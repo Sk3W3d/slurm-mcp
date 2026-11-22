@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import sqlite3
@@ -10,7 +11,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 import anyio
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from . import huggingface as hf
 from . import python_env
@@ -89,7 +90,36 @@ from .validators import (
 )
 
 
-mcp = FastMCP("alliance-slurm")
+SERVER_INSTRUCTIONS = """\
+Runs work on Alliance Canada Slurm clusters through the user's 2FA SSH login.
+
+Connecting: if a tool says the cluster is not connected, call cluster_login and \
+tell the user to approve the Duo push on their phone.
+
+Projects: work is organised by project. Before working on one, call \
+project_use(name) and then project_status() to learn where its code and runs \
+live on each cluster, which jobs are unfinished, and what earlier sessions \
+(possibly other agents) recorded. project_list() shows the known projects.
+
+Keeping the record useful for the next session:
+- Pass purpose= to submit_job with a short reason, e.g. "baseline, lr=3e-4".
+- After a meaningful step, call project_note: a result (with numbers), a \
+decision and why, a problem found, or the next step. Keep notes short and \
+factual; they are how the next session learns the project's progress.
+- Jobs, code syncs, and venv builds are recorded automatically; do not repeat \
+them in notes.
+- On a new machine, or before the user switches machines, call \
+project_record_sync so the record on the cluster and this machine agree.
+
+Cluster rules: login nodes are shared, so run training, evaluation, and heavy \
+preprocessing with submit_job, never with run_remote_command. Compute nodes \
+usually have no internet: download models with hf_download and install \
+packages with setup_venv before the job runs. Prefer dry_run=True to preview \
+a submission. Check jobs with project_status or job_status instead of \
+polling in a tight loop.
+"""
+
+mcp = FastMCP("alliance-slurm", instructions=SERVER_INSTRUCTIONS)
 settings: Settings | None = None
 backend: SSHBackend | None = None
 
@@ -363,8 +393,9 @@ def project_status(
     cluster: str | None = None,
     refresh: bool = True,
     job_limit: int = 20,
+    note_limit: int = 10,
 ) -> dict[str, object]:
-    """Where a project lives on each cluster, its recent and unfinished jobs, background tasks, and latest events.
+    """Where a project lives on each cluster, its jobs and tasks, recent notes, and latest events.
 
     Everything comes from the local project record, which the server fills in
     as it submits jobs, syncs code, and builds venvs. With refresh=True, the
@@ -376,6 +407,7 @@ def project_status(
     ledger = _require_ledger()
     name = _status_project(project)
     safe_limit = validate_limit(job_limit)
+    note_limit = validate_limit(note_limit)
     if cluster is not None:
         clusters = [current_settings.get_cluster(cluster).name]
     else:
@@ -406,10 +438,11 @@ def project_status(
         "project": name,
         "active_project": get_active_project(),
         "clusters": per_cluster,
-        "recent_events": _event_views(ledger.events(project=name, limit=10)),
+        "recent_notes": _note_views(ledger.events(project=name, kind="note", limit=note_limit)),
+        "recent_events": _event_views(ledger.events(project=name, exclude_kind="note", limit=10)),
         "state_db": str(ledger.path),
     }
-    if not clusters:
+    if not clusters and not result["recent_notes"]:
         result["note"] = (
             f"Nothing recorded yet for project '{name}'. Jobs, syncs, and venv builds done through this server are "
             "recorded automatically."
@@ -430,8 +463,8 @@ def project_history(
 
     Events are recorded automatically: job_submitted, job_finished,
     job_cancel_requested, repo_cloned, repo_pulled, repo_checkout,
-    repo_synced, task_started, task_finished. Filter with kind or cluster.
-    Defaults to the active project.
+    repo_synced, task_started, task_finished. Notes added with project_note
+    have kind "note". Filter with kind or cluster. Defaults to the active project.
     """
     current_settings = get_settings()
     ledger = _require_ledger()
@@ -439,6 +472,147 @@ def project_history(
     cluster_name = current_settings.get_cluster(cluster).name if cluster else None
     events = ledger.events(project=name, cluster=cluster_name, kind=kind or None, limit=validate_limit(limit))
     return {"project": name, "count": len(events), "events": _event_views(events)}
+
+
+NOTE_CATEGORIES = ("progress", "result", "decision", "issue", "next_step")
+_NOTE_MAX_CHARS = 4000
+
+
+def _client_name(ctx: Context | None) -> str | None:
+    """Name of the MCP client (for example claude-code or codex) that made the call, if it said."""
+    try:
+        info = ctx.session.client_params.clientInfo  # type: ignore[union-attr]
+        return f"{info.name} {info.version}".strip() if info.version else info.name
+    except Exception:
+        return None
+
+
+@mcp.tool()
+def project_note(
+    text: str,
+    project: str | None = None,
+    category: str = "progress",
+    cluster: str | None = None,
+    job_ids: list[str] | None = None,
+    ctx: Context | None = None,
+) -> dict[str, object]:
+    """Add a note to the project's record so later sessions (any agent) know how the work is going.
+
+    Use it for what the automatic record cannot know: a result ("val acc
+    71.2% at epoch 12, job 4567"), a decision and its reason, a problem found,
+    or the next step. category is one of progress, result, decision, issue,
+    next_step. job_ids links the note to jobs. Notes show up in
+    project_status and project_history(kind="note"). Defaults to the active project.
+    """
+    ledger = _require_ledger()
+    name = _status_project(project)
+    if name is None:
+        raise ValueError("Notes belong to a project: pass project=... or call project_use first.")
+    note = _validate_note(text, "text", _NOTE_MAX_CHARS)
+    if not note:
+        raise ValueError("text must not be empty.")
+    if category not in NOTE_CATEGORIES:
+        raise ValueError(f"category must be one of: {', '.join(NOTE_CATEGORIES)}.")
+    if job_ids is not None and (not isinstance(job_ids, list) or len(job_ids) > 50):
+        raise ValueError("job_ids must be a list of at most 50 Slurm job ids.")
+    safe_job_ids = [validate_job_id(str(job_id)) for job_id in job_ids or []]
+    cluster_name = get_settings().get_cluster(cluster).name if cluster else None
+    data = {"category": category, "job_ids": safe_job_ids, "author": _client_name(ctx)}
+    # The note is the whole point of this call, so a failed write is an error here.
+    ledger.add_event("note", note, project=name, cluster=cluster_name, data=data)
+    return {"project": name, "recorded": True, "cluster": cluster_name, "text": note, **data}
+
+
+def _record_file(settings: Settings, target: Cluster, project: str) -> str:
+    """Where a project's record lives on a cluster: storage.record_root/<project>.json."""
+    resolved = settings.storage_for(target.name, project)
+    root = resolved.values.get("record_root")
+    if root is None:
+        if not target.user:
+            raise ValueError(f"Set storage.record_root or the user for cluster '{target.name}'.")
+        root = f"/home/{target.user}/.slurm-mcp/records"
+    return normalize_remote_root(root, "storage.record_root") + f"/{project}.json"
+
+
+_ATOMIC_WRITE_SCRIPT = (
+    'mkdir -p -- "$(dirname -- "$1")" && tmp="$1.tmp.$$" && cat > "$tmp" && mv -f -- "$tmp" "$1"'
+)
+
+
+@mcp.tool()
+def project_record_sync(project: str | None = None, cluster: str | None = None) -> dict[str, object]:
+    """Merge this machine's record of a project with the copy on a cluster, then update that copy.
+
+    The copy is a JSON file at storage.record_root/<project>.json (default
+    ~/.slurm-mcp/records on the cluster). Syncing pulls what other machines
+    recorded (jobs, notes, events) into this machine's record and pushes the
+    merged result back, so nothing either side recorded is lost. Run it when
+    starting on a machine that has not seen the project recently, and before
+    switching machines. Defaults to the active project and default cluster.
+    """
+    current_settings = get_settings()
+    ledger = _require_ledger()
+    name = _status_project(project)
+    if name is None:
+        raise ValueError("project_record_sync needs a project: pass project=... or call project_use first.")
+    target = current_settings.get_cluster(cluster)
+    path = _record_file(current_settings, target, name)
+
+    pulled = {"events": 0, "jobs": 0, "tasks": 0, "locations": 0}
+    exists = _run_remote_result(current_settings, target, ["test", "-f", path], tool="project_record_sync", timeout=15)
+    if exists.returncode == 0:
+        metadata = parse_stat_output(
+            _run_remote_output(current_settings, target, stat_file_argv(path), tool="project_record_sync", timeout=15)
+        )
+        size = metadata.get("size_bytes")
+        if isinstance(size, int):
+            check_transfer_size(size, current_settings.max_transfer_bytes, "Project record on the cluster")
+        content = _run_remote_output(
+            current_settings, target, ["cat", "--", path], tool="project_record_sync", timeout=60, strip=False
+        )
+        try:
+            snapshot = json.loads(content)
+        except ValueError as exc:
+            raise ValueError(f"{path} on {target.name} is not valid JSON; fix or remove it first. ({exc})") from exc
+        pulled = ledger.import_project(snapshot, name)
+
+    snapshot = ledger.export_project(name)
+    data = json.dumps(snapshot, indent=1, sort_keys=True).encode("utf-8")
+    check_transfer_size(len(data), current_settings.max_transfer_bytes, "Project record")
+    _run_remote_output(
+        current_settings,
+        target,
+        ["bash", "-c", _ATOMIC_WRITE_SCRIPT, "_", path],
+        tool="project_record_sync",
+        timeout=60,
+        input_data=data,
+    )
+    return {
+        "project": name,
+        "cluster": target.name,
+        "path": path,
+        "remote_copy_existed": exists.returncode == 0,
+        "merged_from_cluster": pulled,
+        "pushed": {key: len(snapshot[key]) for key in ("events", "jobs", "tasks", "locations")},
+        "bytes": len(data),
+    }
+
+
+def _note_views(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    views = []
+    for event in events:
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        views.append(
+            {
+                "ts": event.get("ts"),
+                "cluster": event.get("cluster"),
+                "category": data.get("category"),
+                "text": event.get("summary"),
+                "job_ids": data.get("job_ids") or [],
+                "author": data.get("author"),
+            }
+        )
+    return views
 
 
 def _event_views(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

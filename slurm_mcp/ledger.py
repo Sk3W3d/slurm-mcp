@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +22,10 @@ from typing import Any, Iterable
 
 from .slurm import TERMINAL_JOB_STATES
 
-SCHEMA_VERSION = 1
+# 2: events.uid, so records merged from another machine are not duplicated.
+SCHEMA_VERSION = 2
+SNAPSHOT_FORMAT = "slurm-mcp-project-record"
+SNAPSHOT_VERSION = 1
 
 # "missing" means the task folder is gone, so its state can never be read again.
 TERMINAL_TASK_STATES = frozenset({"succeeded", "failed", "lost", "missing"})
@@ -89,7 +93,8 @@ CREATE TABLE IF NOT EXISTS locations (
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    # Milliseconds keep the order of quick successive updates when merging records from two machines.
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def normalize_job_state(state: str | None) -> str | None:
@@ -118,8 +123,15 @@ class Ledger:
         if not self._ready:
             with conn:
                 conn.executescript(_SCHEMA)
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
+                if "uid" not in columns:
+                    conn.execute("ALTER TABLE events ADD COLUMN uid TEXT")
+                    conn.execute("UPDATE events SET uid = lower(hex(randomblob(16))) WHERE uid IS NULL")
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS events_by_uid ON events (uid)")
                 conn.execute(
-                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
+                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+                    "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    (str(SCHEMA_VERSION),),
                 )
             self._ready = True
         return conn
@@ -144,10 +156,8 @@ class Ledger:
         cluster: str | None = None,
         data: dict[str, Any] | None = None,
     ) -> int:
-        return self._write(
-            "INSERT INTO events (ts, project, cluster, kind, summary, data) VALUES (?, ?, ?, ?, ?, ?)",
-            (now(), project, cluster, kind, summary, _dump(data)),
-        )
+        with closing(self._connect()) as conn, conn:
+            return _insert_event(conn, now(), project, cluster, kind, summary, data)
 
     def events(
         self,
@@ -155,13 +165,17 @@ class Ledger:
         project: Any = ANY,
         cluster: str | None = None,
         kind: str | None = None,
+        exclude_kind: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         where, params = _filters(project=project, cluster=cluster)
         if kind:
             where.append("kind = ?")
             params.append(kind)
-        sql = "SELECT * FROM events" + _where(where) + " ORDER BY id DESC LIMIT ?"
+        if exclude_kind:
+            where.append("kind != ?")
+            params.append(exclude_kind)
+        sql = "SELECT * FROM events" + _where(where) + " ORDER BY ts DESC, id DESC LIMIT ?"
         return self._read(sql, [*params, limit])
 
     # -- jobs -----------------------------------------------------------------------
@@ -238,17 +252,20 @@ class Ledger:
                 updated += 1
                 if terminal and not row["terminal"]:
                     detail = ", ".join(part for part in (f"exit {exit_code}" if exit_code else "", elapsed or "") if part)
-                    conn.execute(
-                        "INSERT INTO events (ts, project, cluster, kind, summary, data) VALUES (?, ?, ?, ?, ?, ?)",
-                        (
-                            checked,
-                            row["project"],
-                            cluster,
-                            "job_finished",
-                            f"Job {job_id} ({row['job_name'] or 'unnamed'}) {state}" + (f" ({detail})" if detail else ""),
-                            _dump({"job_id": job_id, "state": state, "exit_code": exit_code, "elapsed": elapsed,
-                                   "array_tasks": info.get("array_tasks")}),
-                        ),
+                    _insert_event(
+                        conn,
+                        checked,
+                        row["project"],
+                        cluster,
+                        "job_finished",
+                        f"Job {job_id} ({row['job_name'] or 'unnamed'}) {state}" + (f" ({detail})" if detail else ""),
+                        {
+                            "job_id": job_id,
+                            "state": state,
+                            "exit_code": exit_code,
+                            "elapsed": elapsed,
+                            "array_tasks": info.get("array_tasks"),
+                        },
                     )
         return updated
 
@@ -326,17 +343,15 @@ class Ledger:
                 (state, exit_code, checked, int(terminal), cluster, task_id),
             )
             if terminal and not row["terminal"]:
-                conn.execute(
-                    "INSERT INTO events (ts, project, cluster, kind, summary, data) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        checked,
-                        row["project"],
-                        cluster,
-                        "task_finished",
-                        f"Task {task_id} ({row['description'] or 'task'}) {state}"
-                        + (f" (exit {exit_code})" if exit_code is not None else ""),
-                        _dump({"task_id": task_id, "state": state, "exit_code": exit_code}),
-                    ),
+                _insert_event(
+                    conn,
+                    checked,
+                    row["project"],
+                    cluster,
+                    "task_finished",
+                    f"Task {task_id} ({row['description'] or 'task'}) {state}"
+                    + (f" (exit {exit_code})" if exit_code is not None else ""),
+                    {"task_id": task_id, "state": state, "exit_code": exit_code},
                 )
             return 1
 
@@ -376,6 +391,91 @@ class Ledger:
         rows = self._read("SELECT cluster, details, updated_at FROM locations WHERE project = ?", (project,))
         return {row["cluster"]: {**row["details"], "updated_at": row["updated_at"]} for row in rows}
 
+    # -- snapshots (copy of a project's record on a cluster) ---------------------------
+
+    def export_project(self, project: str) -> dict[str, Any]:
+        """Everything recorded for one project, as plain JSON-ready data."""
+        with closing(self._connect()) as conn:
+            def rows(sql: str) -> list[dict[str, Any]]:
+                return [dict(row) for row in conn.execute(sql, (project,)).fetchall()]
+
+            return {
+                "format": SNAPSHOT_FORMAT,
+                "version": SNAPSHOT_VERSION,
+                "project": project,
+                "exported_at": now(),
+                "events": rows("SELECT uid, ts, cluster, kind, summary, data FROM events WHERE project = ? ORDER BY ts, id"),
+                "jobs": rows("SELECT * FROM jobs WHERE project = ? ORDER BY submitted_at"),
+                "tasks": rows("SELECT * FROM tasks WHERE project = ? ORDER BY started_at"),
+                "locations": rows("SELECT cluster, details, updated_at FROM locations WHERE project = ?"),
+            }
+
+    def import_project(self, snapshot: Any, project: str) -> dict[str, int]:
+        """Merge a snapshot made by export_project (possibly on another machine) into this ledger.
+
+        Events are matched by uid. For jobs and tasks, the copy whose state was
+        checked more recently wins, and missing fields are filled in. Location
+        details merge key by key, newer copy winning. A job or task finishing
+        is only logged once even if both machines saw it.
+        """
+        if not isinstance(snapshot, dict) or snapshot.get("format") != SNAPSHOT_FORMAT:
+            raise ValueError("Not a slurm-mcp project record.")
+        if snapshot.get("version") != SNAPSHOT_VERSION:
+            raise ValueError(f"Unsupported project record version: {snapshot.get('version')!r}.")
+        if snapshot.get("project") != project:
+            raise ValueError(f"The record is for project {snapshot.get('project')!r}, not {project!r}.")
+
+        counts = {"events": 0, "jobs": 0, "tasks": 0, "locations": 0}
+        with closing(self._connect()) as conn, conn:
+            for event in _records(snapshot, "events"):
+                if not all(isinstance(event.get(key), str) and event.get(key) for key in ("uid", "ts", "kind", "summary")):
+                    continue
+                data = event.get("data")
+                parsed = json.loads(data) if isinstance(data, str) else None
+                if event["kind"] in {"job_finished", "task_finished"} and _finish_logged(conn, project, event, parsed):
+                    continue
+                before = conn.total_changes
+                _insert_event(
+                    conn, event["ts"], project, _text(event.get("cluster")), event["kind"], event["summary"], parsed,
+                    uid=event["uid"],
+                )
+                counts["events"] += conn.total_changes - before
+
+            for job in _records(snapshot, "jobs"):
+                if _merge_row(conn, "jobs", "job_id", project, job, _JOB_COLUMNS, "submitted_at"):
+                    counts["jobs"] += 1
+            for task in _records(snapshot, "tasks"):
+                if _merge_row(conn, "tasks", "task_id", project, task, _TASK_COLUMNS, "started_at"):
+                    counts["tasks"] += 1
+
+            for location in _records(snapshot, "locations"):
+                cluster, details, updated = location.get("cluster"), location.get("details"), location.get("updated_at")
+                if not isinstance(cluster, str) or not isinstance(details, str) or not isinstance(updated, str):
+                    continue
+                incoming = json.loads(details)
+                row = conn.execute(
+                    "SELECT details, updated_at FROM locations WHERE project = ? AND cluster = ?", (project, cluster)
+                ).fetchone()
+                if row is None:
+                    merged, stamp = incoming, updated
+                else:
+                    local = json.loads(row["details"])
+                    newer_incoming = updated > row["updated_at"]
+                    merged = {**local, **incoming} if newer_incoming else {**incoming, **local}
+                    stamp = max(updated, row["updated_at"])
+                    if merged == local:
+                        continue
+                conn.execute(
+                    """
+                    INSERT INTO locations (project, cluster, details, updated_at) VALUES (?, ?, ?, ?)
+                    ON CONFLICT (project, cluster) DO UPDATE SET details = excluded.details,
+                                                                 updated_at = excluded.updated_at
+                    """,
+                    (project, cluster, json.dumps(merged, sort_keys=True), stamp),
+                )
+                counts["locations"] += 1
+        return counts
+
     # -- summaries --------------------------------------------------------------------
 
     def clusters_for(self, project: str | None) -> list[str]:
@@ -406,6 +506,111 @@ class Ledger:
         for row in rows:
             row["clusters"] = sorted((row["clusters"] or "").split(",")) if row["clusters"] else []
         return rows
+
+
+_JOB_COLUMNS = (
+    "job_name", "profile", "script", "purpose", "git_commit", "git_dirty", "submitted_at", "details",
+    "state", "exit_code", "elapsed", "state_checked_at", "terminal",
+)
+_TASK_COLUMNS = (
+    "kind", "description", "started_at", "details", "state", "exit_code", "state_checked_at", "terminal",
+)
+_STATE_COLUMNS = ("state", "exit_code", "elapsed", "state_checked_at", "terminal")
+
+
+def _records(snapshot: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    value = snapshot.get(key) or []
+    if not isinstance(value, list):
+        raise ValueError(f"Project record field '{key}' must be a list.")
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _text(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _scalar(value: Any) -> Any:
+    """Only plain values from a snapshot reach SQLite."""
+    return value if value is None or isinstance(value, (str, int, float)) else None
+
+
+def _merge_row(
+    conn: sqlite3.Connection,
+    table: str,
+    id_column: str,
+    project: str,
+    incoming: dict[str, Any],
+    columns: tuple[str, ...],
+    required: str,
+) -> bool:
+    """Insert or merge one job/task row; returns whether anything changed."""
+    cluster, row_id = incoming.get("cluster"), incoming.get(id_column)
+    if not isinstance(cluster, str) or not isinstance(row_id, str) or not isinstance(incoming.get(required), str):
+        return False
+    values = {column: _scalar(incoming.get(column)) for column in columns if column in incoming}
+    values["terminal"] = int(bool(values.get("terminal")))
+    existing = conn.execute(
+        f"SELECT * FROM {table} WHERE cluster = ? AND {id_column} = ?", (cluster, row_id)
+    ).fetchone()
+    if existing is None:
+        names = ["cluster", id_column, "project", *values]
+        conn.execute(
+            f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})",
+            (cluster, row_id, project, *values.values()),
+        )
+        return True
+
+    updates: dict[str, Any] = {}
+    incoming_checked = values.get("state_checked_at") or ""
+    if isinstance(incoming_checked, str) and incoming_checked > (existing["state_checked_at"] or ""):
+        updates.update({column: values.get(column) for column in _STATE_COLUMNS if column in values})
+    for column, value in values.items():
+        if column not in _STATE_COLUMNS and existing[column] is None and value is not None:
+            updates[column] = value
+    updates = {column: value for column, value in updates.items() if existing[column] != value}
+    if not updates:
+        return False
+    assignments = ", ".join(f"{column} = ?" for column in updates)
+    conn.execute(
+        f"UPDATE {table} SET {assignments} WHERE cluster = ? AND {id_column} = ?",
+        (*updates.values(), cluster, row_id),
+    )
+    return True
+
+
+def _finish_logged(conn: sqlite3.Connection, project: str, event: dict[str, Any], data: Any) -> bool:
+    """Whether this machine already logged the job/task finishing that an imported event reports."""
+    key = "job_id" if event["kind"] == "job_finished" else "task_id"
+    target = data.get(key) if isinstance(data, dict) else None
+    if not isinstance(target, str):
+        return False
+    for row in conn.execute(
+        "SELECT data FROM events WHERE project = ? AND kind = ? AND cluster IS ?",
+        (project, event["kind"], _text(event.get("cluster"))),
+    ):
+        try:
+            if json.loads(row["data"] or "{}").get(key) == target:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _insert_event(
+    conn: sqlite3.Connection,
+    ts: str,
+    project: str | None,
+    cluster: str | None,
+    kind: str,
+    summary: str,
+    data: dict[str, Any] | None,
+    uid: str | None = None,
+) -> int:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO events (uid, ts, project, cluster, kind, summary, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (uid or uuid.uuid4().hex, ts, project, cluster, kind, summary, _dump(data)),
+    )
+    return int(cursor.lastrowid or 0)
 
 
 def _dump(data: dict[str, Any] | None) -> str | None:

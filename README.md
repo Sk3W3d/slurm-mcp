@@ -147,6 +147,27 @@ recorded job's logs without `project=`. A failed write to the record never
 fails the tool. The tool still runs and its result has a `ledger_error` field.
 Set `state_db: null` to turn the record off.
 
+**Notes.** The automatic record holds facts. `project_note` adds what only
+the agent knows: a result ("val acc 71.2% at epoch 12"), a decision and its
+reason, a problem, or the next step. The category is one of `progress`,
+`result`, `decision`, `issue` or `next_step`. A note can link to job IDs and
+records which MCP client wrote it. `project_status` shows the latest notes.
+
+**Agent instructions.** The server publishes MCP instructions that every
+client receives when it connects. They tell the agent to call
+`project_use` and `project_status` before working on a project, to pass
+`purpose=` when submitting, and to leave `project_note`s after meaningful
+steps. The text is `SERVER_INSTRUCTIONS` in `slurm_mcp/server.py`.
+
+**More than one machine.** The record is local, so a second machine starts
+empty. `project_record_sync(project, cluster)` merges this machine's record
+with a copy on the cluster at `storage.record_root/<project>.json` (default
+`~/.slurm-mcp/records`), then writes the merged result back. Events are
+matched by ID, and for jobs the most recently checked state wins, so
+syncing from both machines loses nothing and creates no duplicates. Run it
+when you start on a machine that hasn't seen the project, and before
+switching machines.
+
 ## 3. Register with Claude Code
 
 ```bash
@@ -185,7 +206,8 @@ the directory Claude Code was started in.
 ## Tools
 
 **Projects:** `project_use`, `project_list`, `project_status`,
-`project_history`. Path-based tools below also take `project=`.
+`project_history`, `project_note`, `project_record_sync`. Path-based tools
+below also take `project=`.
 
 **Connection and cluster info:** `cluster_login`, `cluster_logout`,
 `cluster_auth_status`, `cluster_preflight`, `remote_whoami`, `list_clusters`,

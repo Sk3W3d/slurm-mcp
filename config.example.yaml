@@ -98,6 +98,9 @@ cluster_defaults:
     # Background tasks (setup_venv, hf_download). Without {project} their status
     # stays readable after switching projects. Defaults to run_root/mcp-tasks.
     tasks_root: /scratch/{user}/.slurm-mcp/tasks
+    # Copies of project records for project_record_sync (one small JSON file per
+    # project). Defaults to /home/{user}/.slurm-mcp/records; home is backed up.
+    # record_root: /home/{user}/.slurm-mcp/records
 
 clusters:
   killarney:

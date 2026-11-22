@@ -96,6 +96,89 @@ class LedgerTests(unittest.TestCase):
         self.assertIn("exit 2", events[0]["summary"])
 
 
+class SnapshotTests(unittest.TestCase):
+    """Merging the copy of a project's record kept on a cluster."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.laptop = Ledger(root / "laptop.sqlite3")
+        self.desktop = Ledger(root / "desktop.sqlite3")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_round_trip_merges_both_sides_without_duplicates(self) -> None:
+        _job(self.laptop, "100")
+        self.laptop.add_event("note", "baseline started", project="alpha", data={"category": "progress"})
+        self.laptop.update_location("alpha", "narval", remote_repo="/r", commit="aaa")
+
+        counts = self.desktop.import_project(self.laptop.export_project("alpha"), "alpha")
+        self.assertEqual(counts, {"events": 1, "jobs": 1, "tasks": 0, "locations": 1})
+        self.assertEqual(self.desktop.get_job("narval", "100")["purpose"], "baseline")
+
+        # The desktop sees the job finish and adds a note; the laptop then merges that back.
+        self.desktop.update_job_states("narval", {"100": {"state": "COMPLETED", "exit_code": "0:0"}})
+        self.desktop.add_event("note", "acc 71%", project="alpha", data={"category": "result"})
+        self.desktop.update_location("alpha", "narval", commit="bbb")
+        self.laptop.import_project(self.desktop.export_project("alpha"), "alpha")
+
+        self.assertEqual(self.laptop.get_job("narval", "100")["state"], "COMPLETED")
+        self.assertEqual(self.laptop.locations("alpha")["narval"]["commit"], "bbb")
+        self.assertEqual(self.laptop.locations("alpha")["narval"]["remote_repo"], "/r")
+        notes = [event["summary"] for event in self.laptop.events(project="alpha", kind="note")]
+        self.assertEqual(sorted(notes), ["acc 71%", "baseline started"])
+
+        # Importing again changes nothing.
+        again = self.laptop.import_project(self.desktop.export_project("alpha"), "alpha")
+        self.assertEqual(again, {"events": 0, "jobs": 0, "tasks": 0, "locations": 0})
+
+    def test_job_finish_seen_on_both_machines_is_logged_once(self) -> None:
+        _job(self.laptop, "100")
+        self.desktop.import_project(self.laptop.export_project("alpha"), "alpha")
+        for ledger in (self.laptop, self.desktop):
+            ledger.update_job_states("narval", {"100": {"state": "FAILED", "exit_code": "1:0"}})
+        self.laptop.import_project(self.desktop.export_project("alpha"), "alpha")
+        self.assertEqual(len(self.laptop.events(project="alpha", kind="job_finished")), 1)
+
+    def test_older_state_does_not_overwrite_newer(self) -> None:
+        _job(self.laptop, "100")
+        stale = self.laptop.export_project("alpha")
+        self.laptop.update_job_states("narval", {"100": {"state": "COMPLETED"}})
+        self.laptop.import_project(stale, "alpha")
+        self.assertEqual(self.laptop.get_job("narval", "100")["state"], "COMPLETED")
+
+    def test_rejects_foreign_or_malformed_snapshots(self) -> None:
+        snapshot = self.laptop.export_project("alpha")
+        with self.assertRaisesRegex(ValueError, "not 'beta'"):
+            self.laptop.import_project(snapshot, "beta")
+        for bad in ({}, {**snapshot, "version": 99}, {**snapshot, "events": "nope"}, ["x"]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.laptop.import_project(bad, "alpha")
+        # Rows missing required fields are skipped rather than failing the merge.
+        partial = {**snapshot, "jobs": [{"cluster": "narval"}], "events": [{"kind": "note"}]}
+        self.assertEqual(self.laptop.import_project(partial, "alpha")["jobs"], 0)
+
+    def test_migrates_schema_1_database(self) -> None:
+        import sqlite3
+
+        path = Path(self._tmp.name) / "old.sqlite3"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, project TEXT, "
+            "cluster TEXT, kind TEXT NOT NULL, summary TEXT NOT NULL, data TEXT);"
+            "INSERT INTO events (ts, project, kind, summary) VALUES ('2026-11-01T00:00:00+00:00', 'alpha', 'note', 'old');"
+        )
+        conn.commit()
+        conn.close()
+        ledger = Ledger(path)
+        exported = ledger.export_project("alpha")
+        self.assertEqual(len(exported["events"]), 1)
+        self.assertTrue(exported["events"][0]["uid"])
+        ledger.add_event("note", "new", project="alpha")
+        self.assertEqual(len(ledger.events(project="alpha")), 2)
+
+
 class JobStateTests(unittest.TestCase):
     def test_normalize(self) -> None:
         self.assertEqual(normalize_job_state("CANCELLED by 1234"), "CANCELLED")
