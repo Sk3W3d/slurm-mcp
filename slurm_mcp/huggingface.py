@@ -16,7 +16,9 @@ from typing import Any
 from .python_env import module_load_lines
 
 
-HF_TOOLS_VENV_NAME = "_slurm-mcp-hf"
+# Helper venv with huggingface_hub, made by hf_download. Must pass validate_venv_name,
+# so it cannot start with '_' or '.'.
+HF_TOOLS_VENV_NAME = "slurm-mcp-hf-tools"
 _REPO_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}(/[A-Za-z0-9][A-Za-z0-9._-]{0,95})?")
 _REVISION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
 _PATTERN_RE = re.compile(r"[A-Za-z0-9*?._/\[\]-]{1,200}")

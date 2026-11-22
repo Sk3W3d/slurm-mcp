@@ -304,7 +304,7 @@ class LocalToolTests(unittest.TestCase):
             hf.build_download_script(
                 hf_home="/p/hf",
                 modules=["python/3.11"],
-                venv="/v/_slurm-mcp-hf",
+                venv="/v/slurm-mcp-hf-tools",
                 create_venv=True,
                 repo_id="org/model-name",
                 repo_type="model",

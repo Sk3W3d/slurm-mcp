@@ -151,11 +151,17 @@ class HuggingFaceTests(unittest.TestCase):
         self.assertEqual(offline["HF_HUB_OFFLINE"], "1")
         self.assertEqual(hf.job_env("/project/hf", True), {"HF_HOME": "/project/hf"})
 
+    def test_helper_venv_name_is_valid(self) -> None:
+        # hf_download builds this path when no venv is given; an invalid name broke it.
+        self.assertEqual(
+            python_env.venv_path("/v", hf.HF_TOOLS_VENV_NAME), f"/v/{hf.HF_TOOLS_VENV_NAME}"
+        )
+
     def test_download_script_passes_arguments_as_json(self) -> None:
         script = hf.build_download_script(
             hf_home="/project/hf",
             modules=["python/3.11"],
-            venv="/project/venvs/_slurm-mcp-hf",
+            venv="/project/venvs/slurm-mcp-hf-tools",
             create_venv=True,
             repo_id="meta-llama/Llama-3.1-8B",
             repo_type="model",
