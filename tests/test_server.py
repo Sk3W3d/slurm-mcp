@@ -757,6 +757,28 @@ class ProjectToolTests(unittest.TestCase):
         self.assertEqual(pulled["cluster_notes_merged"], 1)
         self.assertEqual([n["text"] for n in server.cluster_notes()["notes"]], ["rrg is GPU-only here."])
 
+    def test_config_reload_keeps_the_backend(self) -> None:
+        config = self.tmp / "config.yaml"
+        server.config_path = config
+        try:
+            backend_before = server.backend
+            raw = yaml.safe_load(config.read_text(encoding="utf-8"))
+            raw["profiles"]["gpu_new"] = {"time": "00:10:00", "gpus": 1}
+            config.write_text(yaml.safe_dump(raw), encoding="utf-8")
+            result = server.config_reload()
+            self.assertTrue(result["reloaded"])
+            self.assertIn("gpu_new", server.get_settings().profiles)
+            self.assertIs(server.backend, backend_before)
+            self.assertEqual(result["connection_settings_changed"], [])
+
+            good = server.get_settings()
+            config.write_text("clusters:\n  local:\n    host: x\n    bogus_key: 1\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "bogus_key"):
+                server.config_reload()
+            self.assertIs(server.get_settings(), good)  # invalid file leaves settings unchanged
+        finally:
+            server.config_path = None
+
     def test_server_instructions_are_published(self) -> None:
         self.assertIn("project_status", server.mcp.instructions)
         self.assertIn("project_note", server.mcp.instructions)

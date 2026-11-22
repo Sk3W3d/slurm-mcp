@@ -3098,10 +3098,52 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+config_path: Path | None = None
+# Settings that only take effect when connections are opened, so reloading cannot apply them to open ones.
+_CONNECTION_SETTINGS = ("ssh_backend", "ssh_command", "ssh_config", "known_hosts", "duo_option", "keepalive_seconds")
+
+
+@mcp.tool()
+def config_reload() -> dict[str, object]:
+    """Re-read config.yaml without restarting the server, keeping open SSH connections (no new 2FA).
+
+    Use it after editing config.yaml (storage paths, accounts, profiles,
+    projects, shell settings). If the new file is invalid, nothing changes
+    and the error says what is wrong. Changes to SSH settings (ssh_backend,
+    ssh_command, known_hosts, ...) only apply to new connections.
+    """
+    global settings
+    if config_path is None:
+        raise ValueError("This server was not started from a config file, so there is nothing to reload.")
+    old = get_settings()
+    new = load_settings(config_path)  # raises on an invalid file, leaving the current settings in place
+    connection_changes = [name for name in _CONNECTION_SETTINGS if getattr(old, name) != getattr(new, name)]
+    settings = new
+    _anchors_ok.clear()
+    if backend is not None and hasattr(backend, "default_users"):
+        backend.default_users = {c.host: c.user for c in new.clusters.values() if c.user}
+    if get_active_project() is not None:
+        validate_project_name(get_active_project())
+    return {
+        "reloaded": True,
+        "config": str(config_path),
+        "clusters": sorted(new.clusters),
+        "added_clusters": sorted(set(new.clusters) - set(old.clusters)),
+        "removed_clusters": sorted(set(old.clusters) - set(new.clusters)),
+        "connection_settings_changed": connection_changes,
+        "note": (
+            "Changed connection settings apply to the next cluster_login; open connections are kept."
+            if connection_changes
+            else "Open connections are kept."
+        ),
+    }
+
+
 def main() -> None:
-    global settings, backend
+    global settings, backend, config_path
     args = parse_args()
-    settings = load_settings(args.config)
+    config_path = Path(args.config).resolve()
+    settings = load_settings(config_path)
     backend = make_backend(settings)
     mcp.run()
 
