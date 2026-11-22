@@ -243,8 +243,29 @@ Pass `no_index=False` for packages that are only on PyPI.
 detached under `tasks_root/<task_id>/` (default `run_root/mcp-tasks`). That folder holds
 `task.sh`, `output.log`, and `exit_code`, so status survives reconnects.
 
-**Escape hatch:** `run_remote_command` runs any bash command, but only when
-`allow_remote_shell: true` is set.
+**Escape hatch:** `run_remote_command(command, reason)` runs any bash command
+on a login node. It's a last resort for when no dedicated tool fits, and it's
+off unless `allow_remote_shell: true`. When it's on:
+
+- **You approve each command.** The server shows the command, cluster,
+  folder and the agent's reason through MCP elicitation (a dialog in Claude
+  Code). If you decline or cancel, or the client can't prompt, it doesn't
+  run.
+- **Clearly destructive commands are always refused**, even when approved.
+  That covers recursive deletion of any configured folder or anything above
+  it (home, project and scratch roots included), `scancel` (use
+  `cancel_job`), recursive `chmod`/`chown`, anything touching `~/.ssh`,
+  `ssh`/`scp`/`rsync` to other hosts, `sudo`, `curl … | sh`, and git
+  force-push. The checks live in `slurm_mcp/shell_guard.py`. They catch
+  accidents, not a determined attacker, so your approval remains the real
+  safeguard.
+- **Every command is recorded.** The command, its reason and the approval
+  go into the audit log, refused ones included, and each command that runs
+  also becomes a `shell_command` event in the project record. That shows
+  which needs keep coming up and should become dedicated tools.
+- **`remote_shell_auto_approve: true` skips the approval prompt.** This is
+  dangerous: whatever a mistaken or prompt-injected agent decides to run then
+  runs under your account. It's off by default.
 
 ## Job submission details
 

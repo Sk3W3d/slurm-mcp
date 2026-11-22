@@ -117,6 +117,8 @@ class Settings:
     duo_option: str = "1"
     keepalive_seconds: int = 60
     allow_remote_shell: bool = False
+    # DANGEROUS when True: run_remote_command stops asking the user to approve each command.
+    remote_shell_auto_approve: bool = False
     max_transfer_bytes: int = 200_000_000
     # Local directories that upload/download/sync tools may touch. Empty means the
     # server's working directory at startup.
@@ -273,7 +275,7 @@ _TOP_LEVEL_KEYS = frozenset(
     {
         "default_cluster", "clusters", "ssh_command", "cluster_defaults", "profiles", "audit_log", "state_db",
         "ssh_backend", "ssh_config", "known_hosts", "duo_option", "keepalive_seconds", "allow_remote_shell",
-        "max_transfer_bytes", "local_roots", "projects", "default_project",
+        "remote_shell_auto_approve", "max_transfer_bytes", "local_roots", "projects", "default_project",
     }
 )
 _SECTION_KEYS = frozenset({"docs", "policies", "setup_hints", "slurm", "storage", "python"})
@@ -372,6 +374,7 @@ def load_settings(path: str | Path) -> Settings:
         duo_option=str(raw.get("duo_option", "1")),
         keepalive_seconds=_positive_int(raw, "keepalive_seconds", 60),
         allow_remote_shell=_bool(raw, "allow_remote_shell", False),
+        remote_shell_auto_approve=_bool(raw, "remote_shell_auto_approve", False),
         max_transfer_bytes=_positive_int(raw, "max_transfer_bytes", 200_000_000),
         local_roots=_string_tuple(raw, "local_roots"),
         projects=_projects(raw.get("projects"), clusters),

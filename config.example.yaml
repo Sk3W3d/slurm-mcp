@@ -33,8 +33,16 @@ state_db: .slurm-mcp-state.sqlite3
 # Cap for upload_file, download_file, and git bundles.
 max_transfer_bytes: 200000000
 
-# Enables run_remote_command, an unrestricted login-node shell. Off by default.
+# Enables run_remote_command: any bash command on a login node, as a last resort
+# when no dedicated tool fits. Each command is shown to you for approval first
+# (through MCP elicitation; clients that cannot prompt are refused), and clearly
+# destructive commands are refused even when approved. Off by default.
 allow_remote_shell: false
+# DANGEROUS: true lets agents run shell commands WITHOUT asking you first.
+# Anything a prompt-injected or mistaken agent decides to run, runs under your
+# account. The built-in denylist is a seatbelt, not a sandbox. Keep this false
+# unless you fully trust the session and are watching it.
+remote_shell_auto_approve: false
 
 cluster_defaults:
   docs:

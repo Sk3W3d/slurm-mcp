@@ -7,16 +7,19 @@ Windows this needs Git Bash; the tests are skipped when no usable bash exists.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from typing import Any
 
+import anyio
 import yaml
 
 from slurm_mcp import server
@@ -317,7 +320,54 @@ class LocalToolTests(unittest.TestCase):
 
     def test_run_remote_command_disabled_by_default(self) -> None:
         with self.assertRaisesRegex(ValueError, "disabled"):
-            server.run_remote_command("echo hi")
+            anyio.run(lambda: server.run_remote_command("echo hi", reason="checking the shell is off"))
+
+    def _enable_shell(self, auto_approve: bool = False) -> None:
+        server.settings = dataclasses.replace(
+            server.get_settings(), allow_remote_shell=True, remote_shell_auto_approve=auto_approve
+        )
+        (self.remote / "repo").mkdir(exist_ok=True)
+
+    def _shell(self, command: str, ctx: Any = None, **kwargs: Any) -> dict[str, Any]:
+        kwargs.setdefault("reason", "no dedicated tool lists disk usage")
+        return anyio.run(lambda: server.run_remote_command(command, ctx=ctx, **kwargs))
+
+    def test_shell_runs_only_after_the_user_approves(self) -> None:
+        self._enable_shell()
+        approving = FakeClient(approve=True)
+        result = self._shell("echo hello from $PWD", ctx=approving)
+        self.assertEqual(result["returncode"], 0)
+        self.assertIn("hello from", result["stdout"])
+        self.assertEqual(result["approval"], "approved by the user")
+        self.assertIn("echo hello from $PWD", approving.prompts[0])
+        self.assertIn("no dedicated tool lists disk usage", approving.prompts[0])
+
+        for client, message in (
+            (FakeClient(approve=False), "declined by the user"),
+            (FakeClient(action="cancel"), "cancel by the user"),
+            (FakeClient(supported=False), "cannot show approval prompts"),
+            (None, "no MCP client"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                self._shell("touch should-not-exist", ctx=client)
+        self.assertFalse((self.remote / "repo" / "should-not-exist").exists())
+
+        audit = (self.tmp / "audit.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"decision": "not_approved"', audit)
+        self.assertIn('"decision": "run"', audit)
+
+    def test_shell_guard_applies_even_with_auto_approve(self) -> None:
+        self._enable_shell(auto_approve=True)
+        self.assertEqual(self._shell("echo auto")["approval"], "auto (remote_shell_auto_approve is on)")
+        with self.assertRaisesRegex(ValueError, "Refused: Recursive rm"):
+            self._shell("rm -rf ..")
+        with self.assertRaisesRegex(ValueError, "Refused: scancel"):
+            self._shell("scancel 123")
+        with self.assertRaisesRegex(ValueError, "reason is required"):
+            self._shell("echo hi", reason="because")
+        events = server.get_ledger().events(kind="shell_command")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["data"]["reason"], "no dedicated tool lists disk usage")
 
 
 @unittest.skipIf(BASH is None, "needs a POSIX bash")
@@ -607,6 +657,21 @@ class ProjectToolTests(unittest.TestCase):
             Path(result["local_path"]),
             self.local / "slurm-mcp-downloads" / "local" / "alpha" / "run_root" / "out.txt",
         )
+
+
+class FakeClient:
+    """Stands in for the MCP Context: records approval prompts and answers them."""
+
+    def __init__(self, approve: bool = True, action: str = "accept", supported: bool = True) -> None:
+        self.prompts: list[str] = []
+        self._approve = approve
+        self._action = action
+        self.session = types.SimpleNamespace(check_client_capability=lambda capability: supported)
+
+    async def elicit(self, message: str, schema: Any) -> Any:
+        self.prompts.append(message)
+        data = schema(approve=self._approve) if self._action == "accept" else None
+        return types.SimpleNamespace(action=self._action, data=data)
 
 
 class RecordingBackend:
