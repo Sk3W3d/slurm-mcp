@@ -102,6 +102,26 @@ class ParamikoBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "CCDB"):
             self.backend._authenticate(transport, settings, passcode=None, duo_option="1", timeout=5, prompts=[])
 
+    def test_known_hosts_skips_malformed_lines(self) -> None:
+        from slurm_mcp.ssh_paramiko import load_known_hosts
+
+        key = paramiko.RSAKey.generate(1024)
+        known = self.ssh_dir / "known_hosts"
+        known.write_text(
+            "# a real comment\n"
+            "; vulcan.alliancecan.ca ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMuIj6T45HqVeJgRotH9Qq46FzidekS2lXkD7FOTltnC\n"
+            "@revoked * ssh-rsa AAAA\n"
+            f"narval.alliancecan.ca ssh-rsa {key.get_base64()}\n"
+            "garbage\n",
+            encoding="utf-8",
+        )
+        host_keys, skipped = load_known_hosts(known)
+        self.assertEqual(skipped, [2, 3, 5])
+        self.assertEqual(host_keys.lookup("narval.alliancecan.ca")["ssh-rsa"], key)
+        self.assertIsNone(host_keys.lookup("vulcan.alliancecan.ca"))
+        missing_keys, missing_skipped = load_known_hosts(self.ssh_dir / "missing")
+        self.assertEqual((len(missing_keys), missing_skipped), (0, []))
+
     def test_unknown_host_key_is_refused(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "known_hosts"):
             self.backend._open_transport(self.settings)

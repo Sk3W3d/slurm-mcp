@@ -21,6 +21,38 @@ import paramiko
 from .ssh import CommandResult, shell_join
 
 
+def load_known_hosts(path: Path) -> tuple[paramiko.HostKeys, list[int]]:
+    """Load known_hosts line by line, skipping lines that cannot be parsed.
+
+    paramiko's HostKeys.load stops at the first malformed line, so one stray
+    line (say, an entry commented out with ';' instead of '#') would block
+    every connection. OpenSSH ignores such lines; so does this. A skipped
+    line cannot vouch for any key, so host key checking stays as strict.
+    Marker lines (@cert-authority, @revoked) are skipped too; paramiko does
+    not support them. Returns the keys and the 1-based numbers of skipped lines.
+    """
+    host_keys = paramiko.HostKeys()
+    skipped: list[int] = []
+    if not path.is_file():
+        return host_keys, skipped
+    for number, raw in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        entry = None
+        if not line.startswith("@"):
+            try:
+                entry = paramiko.hostkeys.HostKeyEntry.from_line(line, number)
+            except Exception:
+                entry = None
+        if entry is None or entry.key is None:
+            skipped.append(number)
+            continue
+        for name in entry.hostnames:
+            host_keys.add(name, entry.key.get_name(), entry.key)
+    return host_keys, skipped
+
+
 _DEFAULT_IDENTITIES = ("id_ed25519", "id_ecdsa", "id_rsa")
 _READ_CHUNK = 65536
 
@@ -70,6 +102,8 @@ class ParamikoBackend:
         self._connections: dict[str, _Connection] = {}
         self._lock = threading.Lock()
         self._host_locks: dict[str, threading.Lock] = {}
+        # Line numbers skipped by the last known_hosts load, reported by login.
+        self.known_hosts_skipped: list[int] = []
 
     # -- connection management -------------------------------------------
 
@@ -137,12 +171,19 @@ class ParamikoBackend:
                 user=settings.user,
                 port=settings.port,
             )
-            return {
+            result: dict[str, Any] = {
                 "connected": True,
                 "reused": False,
                 "message": f"Authenticated as {settings.user}@{settings.hostname}.",
                 "mfa_prompts": prompts,
             }
+            if self.known_hosts_skipped:
+                result["known_hosts_skipped_lines"] = list(self.known_hosts_skipped)
+                result["known_hosts_note"] = (
+                    f"Skipped unreadable lines in {self.known_hosts_path}: "
+                    f"{', '.join(map(str, self.known_hosts_skipped))}. Comment them out with '#' or remove them."
+                )
+            return result
 
     def logout(self, host: str) -> dict[str, Any]:
         with self._host_lock(host):
@@ -216,9 +257,7 @@ class ParamikoBackend:
             conn.transport.close()
 
     def _open_transport(self, settings: HostSettings) -> paramiko.Transport:
-        host_keys = paramiko.HostKeys()
-        if self.known_hosts_path.is_file():
-            host_keys.load(str(self.known_hosts_path))
+        host_keys, self.known_hosts_skipped = load_known_hosts(self.known_hosts_path)
         lookup_name = settings.hostname if settings.port == 22 else f"[{settings.hostname}]:{settings.port}"
         known = host_keys.lookup(lookup_name)
         if not known:
