@@ -179,6 +179,48 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(len(ledger.events(project="alpha")), 2)
 
 
+class ClusterNoteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.laptop = Ledger(root / "laptop.sqlite3")
+        self.desktop = Ledger(root / "desktop.sqlite3")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_general_and_cluster_notes(self) -> None:
+        general = self.laptop.add_cluster_note(cluster=None, category="preference", text="narval first", author=None)
+        self.laptop.add_cluster_note(cluster="narval", category="hardware", text="A100 40GB", author=None)
+        self.laptop.add_cluster_note(cluster="vulcan", category="queue", text="L40S queue ok", author=None)
+        narval = [n["text"] for n in self.laptop.cluster_notes(cluster="narval")]
+        self.assertEqual(narval, ["narval first", "A100 40GB"])  # general notes first
+        self.assertEqual(len(self.laptop.cluster_notes(cluster="narval", include_general=False)), 1)
+        self.assertEqual(len(self.laptop.cluster_notes()), 3)
+        self.assertTrue(self.laptop.remove_cluster_note(general))
+        self.assertFalse(self.laptop.remove_cluster_note(general))
+        self.assertEqual(len(self.laptop.cluster_notes()), 2)
+        self.assertEqual(len(self.laptop.cluster_notes(include_removed=True)), 3)
+
+    def test_sync_merges_and_carries_removals(self) -> None:
+        keep = self.laptop.add_cluster_note(cluster="narval", category="account", text="rrg is GPU-only", author=None)
+        drop = self.laptop.add_cluster_note(cluster="narval", category="queue", text="slow today", author=None)
+        self.assertEqual(self.desktop.import_cluster_notes(self.laptop.export_cluster_notes()), 2)
+        self.desktop.remove_cluster_note(drop)
+        self.desktop.add_cluster_note(cluster=None, category="preference", text="vulcan second", author=None)
+        self.laptop.import_cluster_notes(self.desktop.export_cluster_notes())
+        texts = sorted(n["text"] for n in self.laptop.cluster_notes())
+        self.assertEqual(texts, ["rrg is GPU-only", "vulcan second"])
+        # A stale copy cannot bring the removed note back.
+        stale = {**self.desktop.export_cluster_notes()}
+        stale["notes"] = [dict(n, removed=0, updated_at="2000-01-01T00:00:00+00:00") for n in stale["notes"]]
+        self.laptop.import_cluster_notes(stale)
+        self.assertNotIn("slow today", [n["text"] for n in self.laptop.cluster_notes()])
+        self.assertIn(keep, [n["uid"] for n in self.laptop.cluster_notes()])
+        with self.assertRaises(ValueError):
+            self.laptop.import_cluster_notes({"format": "other"})
+
+
 class JobStateTests(unittest.TestCase):
     def test_normalize(self) -> None:
         self.assertEqual(normalize_job_state("CANCELLED by 1234"), "CANCELLED")

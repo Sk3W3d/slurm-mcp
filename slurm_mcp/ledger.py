@@ -25,6 +25,7 @@ from .slurm import TERMINAL_JOB_STATES
 # 2: events.uid, so records merged from another machine are not duplicated.
 SCHEMA_VERSION = 2
 SNAPSHOT_FORMAT = "slurm-mcp-project-record"
+CLUSTER_NOTES_FORMAT = "slurm-mcp-cluster-notes"
 SNAPSHOT_VERSION = 1
 
 # "missing" means the task folder is gone, so its state can never be read again.
@@ -81,6 +82,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     state_checked_at TEXT,
     terminal INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (cluster, task_id)
+);
+CREATE TABLE IF NOT EXISTS cluster_notes (
+    uid TEXT PRIMARY KEY,
+    cluster TEXT,
+    category TEXT NOT NULL,
+    text TEXT NOT NULL,
+    author TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    removed INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS locations (
     project TEXT NOT NULL,
@@ -390,6 +401,90 @@ class Ledger:
     def locations(self, project: str) -> dict[str, dict[str, Any]]:
         rows = self._read("SELECT cluster, details, updated_at FROM locations WHERE project = ?", (project,))
         return {row["cluster"]: {**row["details"], "updated_at": row["updated_at"]} for row in rows}
+
+    # -- cluster notes (facts and preferences about clusters, not tied to a project) ---
+
+    def add_cluster_note(self, *, cluster: str | None, category: str, text: str, author: str | None) -> str:
+        uid = uuid.uuid4().hex[:12]
+        stamp = now()
+        self._write(
+            "INSERT INTO cluster_notes (uid, cluster, category, text, author, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (uid, cluster, category, text, author, stamp, stamp),
+        )
+        return uid
+
+    def remove_cluster_note(self, uid: str) -> bool:
+        with closing(self._connect()) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE cluster_notes SET removed = 1, updated_at = ? WHERE uid = ? AND removed = 0", (now(), uid)
+            )
+            return cursor.rowcount > 0
+
+    def cluster_notes(
+        self,
+        *,
+        cluster: Any = ANY,
+        category: str | None = None,
+        include_general: bool = True,
+        include_removed: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Notes for a cluster (plus general notes, cluster NULL, unless include_general=False)."""
+        where: list[str] = []
+        params: list[Any] = []
+        if cluster is not ANY:
+            if cluster is None:
+                where.append("cluster IS NULL")
+            elif include_general:
+                where.append("(cluster = ? OR cluster IS NULL)")
+                params.append(cluster)
+            else:
+                where.append("cluster = ?")
+                params.append(cluster)
+        if category:
+            where.append("category = ?")
+            params.append(category)
+        if not include_removed:
+            where.append("removed = 0")
+        sql = "SELECT * FROM cluster_notes" + _where(where) + " ORDER BY cluster IS NOT NULL, cluster, created_at"
+        rows = self._read(sql, params)
+        for row in rows:
+            row["removed"] = bool(row["removed"])
+        return rows
+
+    def export_cluster_notes(self) -> dict[str, Any]:
+        with closing(self._connect()) as conn:
+            notes = [dict(row) for row in conn.execute("SELECT * FROM cluster_notes ORDER BY created_at")]
+        return {"format": CLUSTER_NOTES_FORMAT, "version": SNAPSHOT_VERSION, "exported_at": now(), "notes": notes}
+
+    def import_cluster_notes(self, snapshot: Any) -> int:
+        """Merge notes from another machine by uid; the copy updated most recently wins (removals included)."""
+        if not isinstance(snapshot, dict) or snapshot.get("format") != CLUSTER_NOTES_FORMAT:
+            raise ValueError("Not a slurm-mcp cluster notes file.")
+        changed = 0
+        with closing(self._connect()) as conn, conn:
+            for note in _records(snapshot, "notes"):
+                fields = {key: note.get(key) for key in ("uid", "category", "text", "created_at", "updated_at")}
+                if not all(isinstance(value, str) and value for value in fields.values()):
+                    continue
+                cluster, author = _text(note.get("cluster")), _text(note.get("author"))
+                removed = int(bool(note.get("removed")))
+                row = conn.execute("SELECT updated_at FROM cluster_notes WHERE uid = ?", (fields["uid"],)).fetchone()
+                if row is not None and row["updated_at"] >= fields["updated_at"]:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO cluster_notes (uid, cluster, category, text, author, created_at, updated_at, removed)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (uid) DO UPDATE SET cluster = excluded.cluster, category = excluded.category,
+                        text = excluded.text, author = excluded.author, updated_at = excluded.updated_at,
+                        removed = excluded.removed
+                    """,
+                    (fields["uid"], cluster, fields["category"], fields["text"], author, fields["created_at"],
+                     fields["updated_at"], removed),
+                )
+                changed += 1
+        return changed
 
     # -- snapshots (copy of a project's record on a cluster) ---------------------------
 

@@ -383,6 +383,14 @@ class LocalToolTests(unittest.TestCase):
         )
         self.assertEqual(self._shell("uname -s", ctx=never_asked)["approval"], "auto (read-only allowlist)")
 
+    def test_shell_runs_from_home_when_the_folder_is_missing(self) -> None:
+        self._enable_shell()
+        shutil.rmtree(self.remote / "repo")
+        result = self._shell("pwd")
+        self.assertEqual(result["cwd"], "~")
+        self.assertIn("does not exist yet", result["cwd_note"])
+        self.assertEqual(result["returncode"], 0)
+
     def test_shell_guard_applies_even_with_auto_approve(self) -> None:
         self._enable_shell(auto_approve=True)
         self.assertEqual(self._shell("echo auto")["approval"], "auto (remote_shell_auto_approve is on)")
@@ -664,6 +672,27 @@ class ProjectToolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a file or directory"):
             server.copy_between_clusters("missing", "x", "local", "fixed", source_project="alpha")
 
+    def test_missing_allocation_folder_stops_folder_creation(self) -> None:
+        # workspace_root points into an allocation folder that does not exist on this cluster.
+        storage = dict(server.get_settings().cluster_defaults.storage or {})
+        storage["workspace_root"] = _posix(self.remote) + "/projects/def-nothere/me"
+        server.settings = dataclasses.replace(
+            server.get_settings(),
+            cluster_defaults=dataclasses.replace(server.get_settings().cluster_defaults, storage=storage),
+        )
+        server._anchors_ok.clear()
+        (self.local / "data").mkdir()
+        (self.local / "data" / "a.txt").write_text("a", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "def-nothere does not exist on local"):
+            server.write_file("x.txt", "x", project="alpha")
+        with self.assertRaisesRegex(ValueError, "does not exist on local"):
+            server.upload_directory("data", "inputs/data", base="run_root", project="alpha")
+        self.assertFalse((self.remote / "projects" / "def-nothere").exists())
+        checks = {c["name"]: c for c in server.cluster_preflight(project="alpha", write_check=True)["checks"]}
+        self.assertFalse(checks["storage_anchor"]["ok"])
+        self.assertNotIn("logs_dir_create", checks)
+        self.assertFalse((self.remote / "projects" / "def-nothere").exists())
+
     def test_transfers_respect_the_size_cap(self) -> None:
         server.project_use("alpha")
         server.settings = dataclasses.replace(server.get_settings(), max_transfer_bytes=50)
@@ -676,6 +705,57 @@ class ProjectToolTests(unittest.TestCase):
         (self.remote / "runs" / "alpha" / "big" / "blob.bin").write_bytes(b"0" * 5000)
         with self.assertRaisesRegex(ValueError, "max_transfer_bytes"):
             server.download_directory("big")
+
+    def test_cluster_notes_and_overview(self) -> None:
+        pref = server.cluster_note("Prefer local, then fixed, for light jobs.", category="preference")
+        hw = server.cluster_note("A100 40GB nodes.", cluster="local", category="hardware")
+        server.cluster_note("Slow queue.", cluster="fixed", category="queue")
+        with self.assertRaisesRegex(ValueError, "category"):
+            server.cluster_note("x", category="gossip")
+
+        listed = server.cluster_notes(cluster="local")
+        self.assertEqual([n["text"] for n in listed["notes"]], ["Prefer local, then fixed, for light jobs.", "A100 40GB nodes."])
+        updated = server.cluster_note("A100 40GB; old but priority access.", cluster="local", category="hardware",
+                                      replaces=hw["note_id"])
+        self.assertEqual(updated["replaced"], hw["note_id"])
+        self.assertNotIn("A100 40GB nodes.", [n["text"] for n in server.cluster_notes()["notes"]])
+        with self.assertRaisesRegex(ValueError, "No current cluster note"):
+            server.cluster_note_remove(hw["note_id"])
+
+        info_notes = [n["text"] for n in server.cluster_info("local")["notes"]]
+        self.assertEqual(info_notes, ["Prefer local, then fixed, for light jobs.", "A100 40GB; old but priority access."])
+
+        # Jobs from two projects show up together in the cluster view.
+        server.project_use("alpha")
+        self._sync_project_repo()
+        server.submit_job("cpu", "job.sh", purpose="alpha run")
+        server.project_use("beta")
+        server.sync_local_commits("proj")
+        server.submit_job("cpu", "job.sh", purpose="beta run")
+        overview = server.cluster_overview(refresh=False)
+        self.assertEqual(overview["general_notes"][0]["note_id"], pref["note_id"])
+        local = overview["clusters"]["local"]
+        self.assertEqual(sorted(job["project"] for job in local["recent_jobs"]), ["alpha", "beta"])
+        self.assertEqual(local["notes"][0]["category"], "hardware")
+        self.assertEqual(overview["clusters"]["fixed"]["recent_jobs"], [])
+        status_notes = [n["text"] for n in server.project_status(refresh=False)["cluster_notes"]]
+        self.assertIn("A100 40GB; old but priority access.", status_notes)
+        self.assertNotIn("Slow queue.", status_notes)  # beta only has jobs on local
+
+    def test_record_sync_carries_cluster_notes(self) -> None:
+        settings = server.get_settings()
+        laptop = server.Ledger(self.tmp / "laptop.sqlite3")
+        desktop = server.Ledger(self.tmp / "desktop.sqlite3")
+        server._ledger_cache = (settings, laptop)
+        server.cluster_note("rrg is GPU-only here.", cluster="local", category="account")
+        server.project_note("start", project="alpha")
+        server.project_record_sync(project="alpha")
+        self.assertTrue((self.remote / "records" / "_cluster-notes.json").is_file())
+
+        server._ledger_cache = (settings, desktop)
+        pulled = server.project_record_sync(project="alpha")
+        self.assertEqual(pulled["cluster_notes_merged"], 1)
+        self.assertEqual([n["text"] for n in server.cluster_notes()["notes"]], ["rrg is GPU-only here."])
 
     def test_server_instructions_are_published(self) -> None:
         self.assertIn("project_status", server.mcp.instructions)

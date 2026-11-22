@@ -22,7 +22,7 @@ from . import shell_guard
 from . import transfers
 from .audit import preview_text, write_audit_event
 from .config import Cluster, NeedsProject, Settings, expand_template, load_settings, validate_project_name
-from .ledger import Ledger
+from .ledger import ANY, Ledger
 from .ledger import now as ledger_now
 from .local_files import check_transfer_size, local_git_ok, resolve_local_path, run_local_git
 from .remote_files import (
@@ -104,6 +104,15 @@ Projects: work is organised by project. Before working on one, call \
 project_use(name) and then project_status() to learn where its code and runs \
 live on each cluster, which jobs are unfinished, and what earlier sessions \
 (possibly other agents) recorded. project_list() shows the known projects.
+
+Choosing a cluster: read cluster_notes() first. It holds the user's \
+preferences and experience (which clusters queue fastest, where they have \
+priority, hardware, account quirks such as an allocation that is GPU-only on \
+one cluster). Follow the stated preference unless the job needs something it \
+lacks, and say which cluster you picked and why. cluster_overview() shows \
+the jobs on each cluster across all projects. When you learn something \
+lasting about a cluster (a queue that is slow, a quota that is nearly full), \
+record it with cluster_note.
 
 Keeping the record useful for the next session:
 - Pass purpose= to submit_job with a short reason, e.g. "baseline, lr=3e-4".
@@ -223,7 +232,9 @@ def cluster_info(cluster: str | None = None, project: str | None = None) -> dict
     """
     current_settings = get_settings()
     name = validate_project_name(project) if project else get_active_project()
-    return current_settings.cluster_info(cluster, project=name)
+    info = current_settings.cluster_info(cluster, project=name)
+    info["notes"] = _cluster_notes_for([info["name"]])
+    return info
 
 
 _PROJECT_PATH_KEYS = ("remote_repo", "run_root", "venv_root", "hf_home", "tasks_root")
@@ -449,6 +460,8 @@ def project_status(
         "active_project": get_active_project(),
         "clusters": per_cluster,
         "recent_notes": _note_views(ledger.events(project=name, kind="note", limit=note_limit)),
+        # Facts and preferences about the clusters (not this project); see cluster_note.
+        "cluster_notes": _cluster_notes_for(clusters or None),
         "recent_events": _event_views(ledger.events(project=name, exclude_kind="note", limit=10)),
         "state_db": str(ledger.path),
     }
@@ -568,43 +581,191 @@ def project_record_sync(project: str | None = None, cluster: str | None = None) 
     target = current_settings.get_cluster(cluster)
     path = _record_file(current_settings, target, name)
 
-    pulled = {"events": 0, "jobs": 0, "tasks": 0, "locations": 0}
-    exists = _run_remote_result(current_settings, target, ["test", "-f", path], tool="project_record_sync", timeout=15)
-    if exists.returncode == 0:
-        metadata = parse_stat_output(
-            _run_remote_output(current_settings, target, stat_file_argv(path), tool="project_record_sync", timeout=15)
-        )
-        size = metadata.get("size_bytes")
-        if isinstance(size, int):
-            check_transfer_size(size, current_settings.max_transfer_bytes, "Project record on the cluster")
-        content = _run_remote_output(
-            current_settings, target, ["cat", "--", path], tool="project_record_sync", timeout=60, strip=False
-        )
-        try:
-            snapshot = json.loads(content)
-        except ValueError as exc:
-            raise ValueError(f"{path} on {target.name} is not valid JSON; fix or remove it first. ({exc})") from exc
-        pulled = ledger.import_project(snapshot, name)
-
-    snapshot = ledger.export_project(name)
-    data = json.dumps(snapshot, indent=1, sort_keys=True).encode("utf-8")
-    check_transfer_size(len(data), current_settings.max_transfer_bytes, "Project record")
-    _run_remote_output(
+    existed, pulled, data = _sync_record_file(
         current_settings,
         target,
-        ["bash", "-c", _ATOMIC_WRITE_SCRIPT, "_", path],
-        tool="project_record_sync",
-        timeout=60,
-        input_data=data,
+        path,
+        merge=lambda snapshot: ledger.import_project(snapshot, name),
+        export=lambda: ledger.export_project(name),
+        label="Project record",
+    )
+    pushed = json.loads(data)
+    # Cluster notes are shared by all projects, so they travel with every project sync.
+    notes_path = f"{remote_parent(path)}/{_CLUSTER_NOTES_FILE}"
+    _, notes_pulled, _ = _sync_record_file(
+        current_settings,
+        target,
+        notes_path,
+        merge=ledger.import_cluster_notes,
+        export=ledger.export_cluster_notes,
+        label="Cluster notes",
     )
     return {
         "project": name,
         "cluster": target.name,
         "path": path,
-        "remote_copy_existed": exists.returncode == 0,
+        "remote_copy_existed": existed,
         "merged_from_cluster": pulled,
-        "pushed": {key: len(snapshot[key]) for key in ("events", "jobs", "tasks", "locations")},
+        "pushed": {key: len(pushed[key]) for key in ("events", "jobs", "tasks", "locations")},
         "bytes": len(data),
+        "cluster_notes_merged": notes_pulled,
+    }
+
+
+# Project names start with a letter or digit, so this cannot clash with a project's file.
+_CLUSTER_NOTES_FILE = "_cluster-notes.json"
+
+
+def _sync_record_file(
+    settings: Settings,
+    target: Cluster,
+    path: str,
+    *,
+    merge: Callable[[Any], Any],
+    export: Callable[[], dict[str, Any]],
+    label: str,
+) -> tuple[bool, Any, bytes]:
+    """Pull a JSON record file from the cluster (if present), merge it, and write the merged copy back."""
+    tool = "project_record_sync"
+    pulled: Any = None
+    exists = _run_remote_result(settings, target, ["test", "-f", path], tool=tool, timeout=15)
+    if exists.returncode == 0:
+        metadata = parse_stat_output(_run_remote_output(settings, target, stat_file_argv(path), tool=tool, timeout=15))
+        size = metadata.get("size_bytes")
+        if isinstance(size, int):
+            check_transfer_size(size, settings.max_transfer_bytes, f"{label} on the cluster")
+        content = _run_remote_output(settings, target, ["cat", "--", path], tool=tool, timeout=60, strip=False)
+        try:
+            snapshot = json.loads(content)
+        except ValueError as exc:
+            raise ValueError(f"{path} on {target.name} is not valid JSON; fix or remove it first. ({exc})") from exc
+        pulled = merge(snapshot)
+    data = json.dumps(export(), indent=1, sort_keys=True).encode("utf-8")
+    check_transfer_size(len(data), settings.max_transfer_bytes, label)
+    _run_remote_output(
+        settings, target, ["bash", "-c", _ATOMIC_WRITE_SCRIPT, "_", path], tool=tool, timeout=60, input_data=data
+    )
+    if pulled is None:
+        pulled = {"events": 0, "jobs": 0, "tasks": 0, "locations": 0} if label == "Project record" else 0
+    return exists.returncode == 0, pulled, data
+
+
+CLUSTER_NOTE_CATEGORIES = ("preference", "hardware", "queue", "account", "storage", "software", "issue", "tip")
+
+
+def _cluster_note_view(note: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "note_id": note["uid"],
+        "cluster": note.get("cluster") or "all clusters",
+        "category": note["category"],
+        "text": note["text"],
+        "author": note.get("author"),
+        "updated_at": note["updated_at"],
+        **({"removed": True} if note.get("removed") else {}),
+    }
+
+
+def _cluster_notes_for(clusters: list[str] | None) -> list[dict[str, Any]]:
+    """General notes plus notes for the given clusters (all clusters when None)."""
+    notes = _ledger_read(lambda ledger: ledger.cluster_notes(), [])
+    wanted = None if clusters is None else set(clusters)
+    return [
+        _cluster_note_view(note) for note in notes if not note.get("cluster") or wanted is None or note["cluster"] in wanted
+    ]
+
+
+@mcp.tool()
+def cluster_note(
+    text: str,
+    cluster: str | None = None,
+    category: str = "tip",
+    replaces: str | None = None,
+    ctx: Context | None = None,
+) -> dict[str, object]:
+    """Record a fact or preference about a cluster, shared by every agent and session.
+
+    Use it for knowledge that is not about one project: which clusters to
+    prefer and why (queue times, priority access), hardware, account quirks
+    (e.g. an allocation that is GPU-only on a cluster), quotas, software
+    issues. Leave cluster unset for a note about choosing between clusters.
+    category is one of preference, hardware, queue, account, storage,
+    software, issue, tip. Pass replaces=<note_id> to update an outdated note.
+    Notes show up in cluster_notes, cluster_overview, cluster_info, and
+    project_status.
+    """
+    ledger = _require_ledger()
+    note = _validate_note(text, "text", _NOTE_MAX_CHARS)
+    if not note:
+        raise ValueError("text must not be empty.")
+    if category not in CLUSTER_NOTE_CATEGORIES:
+        raise ValueError(f"category must be one of: {', '.join(CLUSTER_NOTE_CATEGORIES)}.")
+    cluster_name = get_settings().get_cluster(cluster).name if cluster else None
+    if replaces and not ledger.remove_cluster_note(replaces):
+        raise ValueError(f"No current cluster note with id {replaces}; see cluster_notes for ids.")
+    uid = ledger.add_cluster_note(cluster=cluster_name, category=category, text=note, author=_client_name(ctx))
+    return {"recorded": True, "note_id": uid, "cluster": cluster_name or "all clusters", "category": category,
+            "text": note, **({"replaced": replaces} if replaces else {})}
+
+
+@mcp.tool()
+def cluster_note_remove(note_id: str) -> dict[str, object]:
+    """Remove an outdated cluster note (it stays in the record as removed, so syncing does not bring it back)."""
+    if not _require_ledger().remove_cluster_note(note_id):
+        raise ValueError(f"No current cluster note with id {note_id}.")
+    return {"removed": True, "note_id": note_id}
+
+
+@mcp.tool()
+def cluster_notes(cluster: str | None = None, category: str | None = None) -> dict[str, object]:
+    """List cluster notes: general ones (such as which cluster to prefer) plus notes for one cluster or all.
+
+    Read these before choosing where to run a job: they hold the user's
+    preferences and experience (queue times, priority access, hardware,
+    account quirks).
+    """
+    ledger = _require_ledger()
+    cluster_name = get_settings().get_cluster(cluster).name if cluster else ANY
+    notes = ledger.cluster_notes(cluster=cluster_name, category=category or None)
+    return {"cluster": cluster or "all", "count": len(notes), "notes": [_cluster_note_view(note) for note in notes]}
+
+
+@mcp.tool()
+def cluster_overview(
+    cluster: str | None = None,
+    refresh: bool = True,
+    job_limit: int = 10,
+) -> dict[str, object]:
+    """Per-cluster view across all projects: notes, connection, and the jobs this server submitted there.
+
+    For each cluster (or just one): its cluster notes, whether it is
+    connected, job counts by state, unfinished jobs, and the most recent jobs,
+    each with its project and purpose. With refresh=True, unfinished jobs on
+    connected clusters are re-read from Slurm first. General notes (such as
+    cluster preferences) are listed once at the top.
+    """
+    current_settings = get_settings()
+    ledger = _require_ledger()
+    safe_limit = validate_limit(job_limit)
+    names = [current_settings.get_cluster(cluster).name] if cluster else sorted(current_settings.clusters)
+    all_notes = ledger.cluster_notes()
+    per_cluster: dict[str, object] = {}
+    for name in names:
+        target = current_settings.get_cluster(name)
+        if refresh:
+            state = _refresh_cluster(current_settings, ledger, target, ANY)
+        else:
+            check = get_backend().check(target.host)
+            state = {"connected": check.returncode == 0, "refreshed": False}
+        per_cluster[name] = {
+            **state,
+            "notes": [_cluster_note_view(note) for note in all_notes if note.get("cluster") == name],
+            "job_counts": ledger.job_state_counts(project=ANY, cluster=name),
+            "unfinished_jobs": [_job_view(job) for job in ledger.jobs(project=ANY, cluster=name, active_only=True, limit=safe_limit)],
+            "recent_jobs": [_job_view(job) for job in ledger.jobs(project=ANY, cluster=name, limit=safe_limit)],
+        }
+    return {
+        "general_notes": [_cluster_note_view(note) for note in all_notes if not note.get("cluster")],
+        "clusters": per_cluster,
     }
 
 
@@ -915,6 +1076,7 @@ def submit_job(
         }
 
     if log_dir:
+        _require_anchor(current_settings, target, roots.project, "submit_job")
         _run_remote_output(
             current_settings,
             target,
@@ -1337,6 +1499,7 @@ def write_file(
     data = content.encode("utf-8")
     if len(data) > _WRITE_FILE_MAX_BYTES:
         raise ValueError(f"content is larger than {_WRITE_FILE_MAX_BYTES} bytes; use upload_file instead.")
+    _require_anchor(current_settings, target, roots.project, "write_file")
     result = _run_remote_result(
         current_settings,
         target,
@@ -1379,6 +1542,7 @@ def upload_file(
     if not resolved.relative:
         raise ValueError("remote_path must name a file inside the root, not the root itself.")
 
+    _require_anchor(current_settings, target, roots.project, "upload_file")
     precheck = 'mkdir -p -- "$1"'
     if not overwrite:
         precheck += ' && if [ -e "$2" ]; then echo "Refusing to overwrite existing file: $2" >&2; exit 17; fi'
@@ -1464,6 +1628,32 @@ def download_file(
         "local_path": str(destination),
         "bytes": destination.stat().st_size,
     }
+
+
+_anchors_ok: set[tuple[str, str]] = set()
+
+
+def _require_anchor(settings: Settings, target: Cluster, project: str | None, tool: str) -> None:
+    """Refuse to create folders when the folder holding workspace_root is missing.
+
+    Tools create their folders with mkdir -p. If workspace_root points into an
+    allocation the user does not have on this cluster (say ~/projects/def-x),
+    mkdir -p would quietly build a fake tree in $HOME instead. Checked once per
+    cluster and anchor per server run.
+    """
+    workspace = settings.storage_for(target.name, project).values.get("workspace_root")
+    if not workspace or not workspace.startswith("/"):
+        return
+    anchor = remote_parent(normalize_remote_root(workspace, "storage.workspace_root"))
+    if (target.name, anchor) in _anchors_ok:
+        return
+    if _remote_kind(settings, target, anchor, tool) != "dir":
+        raise ValueError(
+            f"{anchor} does not exist on {target.name}, so nothing will be created under {workspace}. "
+            f"Check storage.workspace_root for {target.name} in config.yaml (for example, whether you have "
+            "that allocation on this cluster; ls ~/projects shows the ones you do)."
+        )
+    _anchors_ok.add((target.name, anchor))
 
 
 def _human_bytes(count: int | None) -> str:
@@ -1594,6 +1784,7 @@ def upload_directory(
             raise ValueError(f"{resolved.path} exists and is not a directory.")
         if not overwrite:
             raise ValueError(f"{resolved.path} already exists. Pass overwrite=True to merge into it.")
+    _require_anchor(current_settings, target, roots.project, "upload_directory")
 
     with tempfile.TemporaryDirectory(prefix="slurm-mcp-") as tmp:
         archive = Path(tmp) / "upload.tar"
@@ -1738,6 +1929,7 @@ def copy_between_clusters(
             raise ValueError(f"{dst_target.name}:{dst.path} already exists. Pass overwrite=True to replace or merge.")
         if existing != kind:
             raise ValueError(f"{dst_target.name}:{dst.path} exists but is a {existing}, and the source is a {kind}.")
+    _require_anchor(current_settings, dst_target, dst_roots.project, tool)
     size = _remote_size(current_settings, src_target, src.path, excludes if kind == "dir" else [], tool)
 
     if src_target.name == dst_target.name:
@@ -1919,8 +2111,16 @@ def cluster_preflight(
 
     if storage_ok:
         run_root = roots.get("run_root")
-        # The write check creates run_root/logs, so run it before the existence checks.
-        if run_root:
+        anchor_check: dict[str, object] = {"name": "storage_anchor", "required": True}
+        try:
+            _require_anchor(current_settings, target, info.get("project"), "cluster_preflight")
+            anchor_check["ok"] = True
+        except ValueError as exc:
+            anchor_check.update(ok=False, error=str(exc))
+        checks.append(anchor_check)
+        # The write check creates run_root/logs, so run it before the existence checks
+        # (and not at all when the anchor is missing, so nothing lands in a fake tree).
+        if run_root and anchor_check["ok"]:
             logs_dir = f"{run_root}/logs"
             if write_check:
                 checks.append(
@@ -2240,6 +2440,7 @@ def remote_git_clone(
     )
     if exists.returncode == 0:
         raise ValueError(f"{remote_repo} already exists. Use remote_git_pull or sync_local_commits instead.")
+    _require_anchor(current_settings, target, repo_project, "remote_git_clone")
     _run_remote_output(
         current_settings, target, ["mkdir", "-p", remote_parent(remote_repo)], tool="remote_git_clone", timeout=30
     )
@@ -2303,6 +2504,7 @@ def sync_local_commits(
     if has_repo.returncode != 0:
         if not init_if_missing:
             raise ValueError(f"{remote_repo} is not a Git repository. Pass init_if_missing=True or clone it first.")
+        _require_anchor(current_settings, target, repo_project, "sync_local_commits")
         # A placeholder initial branch keeps the target branch free, since Git will not fetch into the
         # checked-out branch; it disappears once the real branch is checked out.
         init_script = (
@@ -2805,7 +3007,16 @@ async def run_remote_command(
     if not isinstance(timeout, int) or timeout < 1 or timeout > 600:
         raise ValueError("timeout must be between 1 and 600 seconds.")
     target, roots = _file_context(current_settings, cluster, project)
-    cwd = resolve_remote_path(None, roots, base=validate_file_base(cwd_base), label="cwd").path
+    configured_cwd = resolve_remote_path(None, roots, base=validate_file_base(cwd_base), label="cwd").path
+    cwd: str | None = configured_cwd
+    cwd_note = None
+    # On a cluster where nothing has been set up yet the folder may not exist; run from
+    # home rather than failing every command, and say so.
+    if await anyio.to_thread.run_sync(
+        lambda: _remote_kind(current_settings, target, configured_cwd, "run_remote_command")
+    ) != "dir":
+        cwd = None
+        cwd_note = f"{configured_cwd} does not exist yet, so the command ran in your home folder."
     storage = roots.info.get("storage", {})
     protected = [value for value in storage.values() if isinstance(value, str) and value.startswith("/")]
     event = {
@@ -2817,7 +3028,8 @@ async def run_remote_command(
         "reason": safe_reason,
     }
 
-    problems = shell_guard.check_command(command, user=target.user, protected=protected, cwd=cwd)
+    home = f"/home/{target.user}" if target.user else None
+    problems = shell_guard.check_command(command, user=target.user, protected=protected, cwd=cwd or home)
     if problems:
         _write_remote_audit(current_settings, {**event, "decision": "refused_by_guard", "problems": problems})
         raise ValueError("Refused: " + " ".join(problems))
@@ -2834,7 +3046,7 @@ async def run_remote_command(
     else:
         prompt = (
             f"An agent wants to run this on {target.name} ({target.user or 'you'}@{target.host}):\n\n"
-            f"    {command}\n\nin {cwd}\n\nReason given: {safe_reason}\n"
+            f"    {command}\n\nin {cwd or 'your home folder'}\n\nReason given: {safe_reason}\n"
             f"Asking because {needs_approval_because}.\n\nApprove?"
         )
         approved, approval = await _approve_shell(ctx, prompt)
@@ -2865,7 +3077,8 @@ async def run_remote_command(
     return {
         "cluster": target.name,
         "host": target.host,
-        "cwd": cwd,
+        "cwd": cwd or "~",
+        **({"cwd_note": cwd_note} if cwd_note else {}),
         "approval": approval,
         "returncode": result.returncode,
         "stdout": stdout,
@@ -3220,6 +3433,7 @@ def _launch_task(
     description: str,
     details: dict[str, Any] | None = None,
 ) -> dict[str, object]:
+    _require_anchor(settings, target, storage.project, f"task:{kind}")
     task_id = remote_tasks.new_task_id(kind)
     directory = _task_dir(storage, task_id)
     script_path = f"{directory}/task.sh"

@@ -161,6 +161,27 @@ client receives when it connects. They tell the agent to call
 `purpose=` when submitting, and to leave `project_note`s after meaningful
 steps. The text is `SERVER_INSTRUCTIONS` in `slurm_mcp/server.py`.
 
+**Cluster notes.** Knowledge about the clusters themselves goes in
+cluster notes, not project notes: which clusters to prefer and why, hardware,
+queue experience, account quirks and quotas.
+
+- **Adding notes.** `cluster_note(text, cluster=None, category=...)` adds one.
+  Leave `cluster` unset for general notes such as a preference order. The
+  category is one of `preference`, `hardware`, `queue`, `account`, `storage`,
+  `software`, `issue` or `tip`. Notes go stale, so
+  `cluster_note(..., replaces=<note_id>)` updates one and
+  `cluster_note_remove` retires it.
+- **Reading notes.** `cluster_notes()` lists them. They also appear in
+  `cluster_info`, `project_status` (for the clusters the project uses) and
+  `cluster_overview`. The server instructions tell agents to read them before
+  choosing a cluster.
+- **Jobs per cluster.** `cluster_overview()` is the per-cluster view across
+  all projects: each cluster's notes, whether it's connected, and the
+  unfinished and recent jobs the server submitted there, each with its
+  project and purpose. Job records themselves live in the project record.
+- **Syncing.** `project_record_sync` also syncs cluster notes, through
+  `_cluster-notes.json` next to the project files.
+
 **More than one machine.** The record is local, so a second machine starts
 empty. `project_record_sync(project, cluster)` merges this machine's record
 with a copy on the cluster at `storage.record_root/<project>.json` (default
