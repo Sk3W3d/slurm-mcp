@@ -1,13 +1,76 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import yaml
+
+
+_PROJECT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+# Placeholders filled from the cluster and the selected project rather than from storage keys.
+BUILTIN_PLACEHOLDERS = ("user", "cluster", "project")
+
+
+def validate_project_name(name: str) -> str:
+    if not isinstance(name, str) or not _PROJECT_NAME_RE.fullmatch(name):
+        raise ValueError(
+            "Invalid project name. Use 1-64 letters, numbers, '.', '_', or '-', starting with a letter or number."
+        )
+    return name
+
+
+class NeedsProject(Exception):
+    """A template uses {project} (directly or through another key) but no project was selected."""
+
+
+def expand_template(
+    template: str,
+    variables: dict[str, str],
+    lookup: Callable[[str], str] | None = None,
+) -> str:
+    """Replace {name} placeholders.
+
+    Built-in names come from variables; any other name goes to lookup(name).
+    Raises NeedsProject when {project} is used without a project.
+    """
+
+    def substitute(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name in variables:
+            return variables[name]
+        if name == "project":
+            raise NeedsProject()
+        if name == "user":
+            raise ValueError("Template uses {user}, but the cluster has no 'user' configured.")
+        if lookup is not None:
+            return lookup(name)
+        raise ValueError(f"Unknown placeholder {{{name}}}. Use {{user}}, {{cluster}}, or {{project}}.")
+
+    return _PLACEHOLDER_RE.sub(substitute, template)
+
+
+@dataclass(frozen=True)
+class ResolvedStorage:
+    values: dict[str, str]
+    # Storage keys left out because they need {project} and no project was selected.
+    pending_project: tuple[str, ...]
+    # Whether the project changed any path (through a {project} template or a project override).
+    project_applies: bool
+
+
+@dataclass(frozen=True)
+class Project:
+    name: str
+    description: str | None = None
+    storage: dict[str, str] | None = None
+    # Per-cluster storage overrides for this project.
+    clusters: dict[str, dict[str, str]] | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +118,9 @@ class Settings:
     # Local directories that upload/download/sync tools may touch. Empty means the
     # server's working directory at startup.
     local_roots: tuple[str, ...] = ()
+    projects: dict[str, Project] = field(default_factory=dict)
+    # Project selected when the server starts; project_use changes it at runtime.
+    default_project: str | None = None
 
     def resolved_ssh_backend(self) -> str:
         if self.ssh_backend != "auto":
@@ -80,25 +146,63 @@ class Settings:
             known = ", ".join(sorted(self.clusters))
             raise ValueError(f"Unknown cluster '{cluster_name}'. Known clusters: {known}") from exc
 
-    def cluster_info(self, name: str | None = None) -> dict[str, Any]:
+    def template_variables(self, name: str | None = None, project: str | None = None) -> dict[str, str]:
         cluster = self.get_cluster(name)
-        storage = _merge_dicts(self.cluster_defaults.storage, cluster.storage)
+        variables = {"cluster": cluster.name}
+        if cluster.user:
+            variables["user"] = cluster.user
+        if project is not None:
+            variables["project"] = validate_project_name(project)
+        return variables
+
+    def storage_for(self, name: str | None = None, project: str | None = None) -> ResolvedStorage:
+        """Merge the storage layers for a cluster and project, then expand {placeholders}.
+
+        Layers, later wins: cluster_defaults.storage, the cluster's storage, the
+        project's storage, and the project's per-cluster storage.
+        """
+        cluster = self.get_cluster(name)
+        raw = _merge_dicts(self.cluster_defaults.storage, cluster.storage)
         if cluster.remote_repo is not None:
-            storage["remote_repo"] = cluster.remote_repo
+            raw["remote_repo"] = cluster.remote_repo
         if cluster.run_root is not None:
-            storage["run_root"] = cluster.run_root
+            raw["run_root"] = cluster.run_root
+
+        overridden = False
+        if project is not None:
+            spec = self.projects.get(validate_project_name(project))
+            if spec is not None:
+                for layer in (spec.storage, (spec.clusters or {}).get(cluster.name)):
+                    if layer:
+                        raw = _merge_dicts(raw, layer)
+                        overridden = True
+
+        variables = self.template_variables(cluster.name, project)
+        values, pending, used_project = _expand_storage(raw, variables, cluster.name)
+        return ResolvedStorage(
+            values=values,
+            pending_project=pending,
+            project_applies=project is not None and (overridden or used_project),
+        )
+
+    def cluster_info(self, name: str | None = None, project: str | None = None) -> dict[str, Any]:
+        cluster = self.get_cluster(name)
+        resolved = self.storage_for(cluster.name, project)
 
         return {
             "name": cluster.name,
             "host": cluster.host,
             "user": cluster.user,
+            "project": project if resolved.project_applies else None,
+            "project_applies": resolved.project_applies,
+            "storage_pending_project": list(resolved.pending_project),
             "docs": list(_merge_docs(self.cluster_defaults.docs, cluster.docs)),
             "policies": _merge_dicts(self.cluster_defaults.policies, cluster.policies),
             "setup_hints": _setup_hints_to_lists(
                 _merge_dicts(self.cluster_defaults.setup_hints, cluster.setup_hints)
             ),
             "slurm": _merge_dicts(self.cluster_defaults.slurm, cluster.slurm),
-            "storage": storage,
+            "storage": resolved.values,
             "python": _merge_dicts(self.cluster_defaults.python, cluster.python),
             "profiles": deepcopy(self.profiles or {}),
         }
@@ -175,7 +279,7 @@ def load_settings(path: str | Path) -> Settings:
         host = value.get("host")
         if not isinstance(host, str) or not host:
             raise ValueError(f"Cluster '{name}' must define a non-empty host.")
-        storage = _string_mapping(value, "storage")
+        storage = _storage_mapping(value, f"clusters.{name}.storage")
         clusters[name] = Cluster(
             name=name,
             host=host,
@@ -194,6 +298,10 @@ def load_settings(path: str | Path) -> Settings:
     if default_cluster not in clusters:
         raise ValueError(f"default_cluster '{default_cluster}' is not defined in clusters.")
 
+    default_project = _optional_string(raw, "default_project")
+    if default_project is not None:
+        validate_project_name(default_project)
+
     return Settings(
         default_cluster=str(default_cluster),
         clusters=clusters,
@@ -210,7 +318,105 @@ def load_settings(path: str | Path) -> Settings:
         allow_remote_shell=_bool(raw, "allow_remote_shell", False),
         max_transfer_bytes=_positive_int(raw, "max_transfer_bytes", 200_000_000),
         local_roots=_string_tuple(raw, "local_roots"),
+        projects=_projects(raw.get("projects"), clusters),
+        default_project=default_project,
     )
+
+
+def _projects(raw: Any, clusters: dict[str, Cluster]) -> dict[str, Project]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("'projects' must be a mapping of project names to settings.")
+    projects: dict[str, Project] = {}
+    for name, value in raw.items():
+        validate_project_name(name)
+        value = value or {}
+        if not isinstance(value, dict):
+            raise ValueError(f"Project '{name}' must be a mapping.")
+        unknown = set(value) - {"description", "storage", "clusters"}
+        if unknown:
+            raise ValueError(f"Project '{name}' has unknown keys: {', '.join(sorted(unknown))}.")
+        clusters_raw = value.get("clusters") or {}
+        if not isinstance(clusters_raw, dict):
+            raise ValueError(f"projects.{name}.clusters must be a mapping.")
+        per_cluster: dict[str, dict[str, str]] = {}
+        for cluster_name, cluster_value in clusters_raw.items():
+            if cluster_name not in clusters:
+                raise ValueError(f"projects.{name}.clusters.{cluster_name}: unknown cluster.")
+            if not isinstance(cluster_value, dict) or set(cluster_value) - {"storage"}:
+                raise ValueError(f"projects.{name}.clusters.{cluster_name} may only set 'storage'.")
+            per_cluster[cluster_name] = _storage_mapping(
+                cluster_value, f"projects.{name}.clusters.{cluster_name}.storage"
+            )
+        projects[name] = Project(
+            name=name,
+            description=_optional_string(value, "description"),
+            storage=_storage_mapping(value, f"projects.{name}.storage"),
+            clusters=per_cluster,
+        )
+    return projects
+
+
+def _storage_mapping(mapping: dict[str, Any], label: str) -> dict[str, str]:
+    storage = _string_mapping(mapping, "storage")
+    reserved = sorted(set(storage) & set(BUILTIN_PLACEHOLDERS))
+    if reserved:
+        raise ValueError(f"{label} cannot define {', '.join(reserved)}: those names are reserved placeholders.")
+    return storage
+
+
+def _expand_storage(
+    raw: dict[str, Any],
+    variables: dict[str, str],
+    cluster_name: str,
+) -> tuple[dict[str, str], tuple[str, ...], bool]:
+    """Expand {placeholders} in storage values. Values may reference other storage keys.
+
+    Returns the expanded values, the keys that need a project that was not
+    given, and whether {project} was substituted anywhere.
+    """
+    resolved: dict[str, str] = {}
+    pending: set[str] = set()
+    used_project = False
+
+    def resolve(key: str, stack: tuple[str, ...]) -> str:
+        nonlocal used_project
+        if key in resolved:
+            return resolved[key]
+        if key in pending:
+            raise NeedsProject()
+        if key in stack:
+            chain = " -> ".join((*stack, key))
+            raise ValueError(f"Cluster '{cluster_name}': storage placeholders form a cycle: {chain}.")
+
+        def lookup(name: str) -> str:
+            if name not in raw:
+                raise ValueError(
+                    f"Cluster '{cluster_name}': storage.{key} uses unknown placeholder {{{name}}}. "
+                    "Use {user}, {cluster}, {project}, or another storage key."
+                )
+            return resolve(name, (*stack, key))
+
+        try:
+            value = expand_template(raw[key], variables, lookup)
+        except ValueError as exc:
+            if "no 'user'" in str(exc):
+                raise ValueError(
+                    f"Cluster '{cluster_name}': storage.{key} uses {{user}}, but the cluster sets no user."
+                ) from exc
+            raise
+        if "project" in variables and "{project}" in raw[key]:
+            used_project = True
+        resolved[key] = value
+        return value
+
+    for key in raw:
+        try:
+            resolve(key, ())
+        except NeedsProject:
+            pending.add(key)
+    return resolved, tuple(sorted(pending)), used_project
 
 
 def _choice(mapping: dict[str, Any], key: str, choices: set[str], default: str) -> str:

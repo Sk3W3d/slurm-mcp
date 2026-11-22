@@ -58,15 +58,62 @@ For each cluster, `config.yaml` sets the following under `storage`:
 | key | used for |
 |---|---|
 | `remote_repo` | your code on the cluster (Git tools, job scripts, `submit_job` working directory) |
-| `run_root` | logs (`run_root/logs`), outputs, and background task folders (`run_root/mcp-tasks`) |
+| `run_root` | job logs (`run_root/logs`), outputs, and the default folder for file tools |
 | `venv_root` | virtualenvs made by `setup_venv` |
 | `hf_home` | shared Hugging Face cache that jobs read through `HF_HOME` |
+| `tasks_root` | background task folders (optional; defaults to `run_root/mcp-tasks`) |
 
 Values in `cluster_defaults` apply to every cluster, and each cluster can
-override them. `python.module` picks the Lmod Python module (for example
-`python/3.11`). `slurm.default_account` fills in `--account`.
+override them key by key. `python.module` picks the Lmod Python module (for
+example `python/3.11`). `slurm.default_account` fills in `--account`.
 `policies.compute_node_internet: false` makes jobs run with the Hugging Face
 offline flags.
+
+### Projects
+
+Storage values are templates, so one config serves many projects:
+
+```yaml
+cluster_defaults:
+  python:
+    venv_name: "{project}"                     # one venv per project
+  storage:
+    workspace_root: /project/def-yourpi/{user}/code
+    remote_repo: "{workspace_root}/{project}"
+    run_root: /scratch/{user}/runs/{project}
+    venv_root: /home/{user}/venvs
+    hf_home: /project/def-yourpi/{user}/hf     # shared by all projects
+    tasks_root: /scratch/{user}/.slurm-mcp/tasks
+```
+
+`{user}` and `{cluster}` come from the cluster entry, `{project}` from the
+selected project, and any other name refers to another storage key. Every
+tool that touches project paths takes `project=`. Without it, tools use the
+project picked with `project_use`, or `default_project` from the config.
+
+- A new project needs no config edit. Pick a name, then `remote_git_clone` or
+  `sync_local_commits` creates its folder.
+- Paths without `{project}` (here `hf_home`, `venv_root`, `tasks_root`) are
+  shared, so tools that only use them, such as `hf_download` and
+  `remote_task_status`, work without a project.
+- Keep `run_root` outside `remote_repo`. Untracked log files inside the repo
+  make `remote_git_pull` and `remote_git_checkout` refuse to run.
+- A project whose checkout doesn't follow the template can override paths
+  under `projects:`, for all clusters or one:
+
+  ```yaml
+  projects:
+    old-paper:
+      description: Camera-ready runs.
+      clusters:
+        narval:
+          storage:
+            remote_repo: /project/def-yourpi/{user}/old-paper
+  ```
+
+- Passing `project=` to a cluster whose storage has no `{project}` is an
+  error, so a call never lands in the wrong project's folder. The active
+  project is ignored on such clusters.
 
 ## 3. Register with Claude Code
 
@@ -85,22 +132,27 @@ the directory Claude Code was started in.
 
 1. `cluster_login(cluster="narval")`: approve the Duo push. Then run
    `cluster_preflight()`.
-2. Get code onto the cluster. Use `remote_git_clone(url)` the first time.
+2. `project_use("my-paper")` selects the project. `project_list(cluster="narval")`
+   shows the projects already on a cluster.
+3. Get code onto the cluster. Use `remote_git_clone(url)` the first time.
    After that, use `remote_git_pull(dry_run=False)` to pick up changes pushed
    to GitHub, or `sync_local_commits()` to send local commits that aren't
    pushed.
-3. `setup_venv(requirements="requirements.txt")` starts a background task.
+4. `setup_venv(requirements="requirements.txt")` starts a background task.
    Poll it with `remote_task_status(task_id)`.
-4. `hf_download("meta-llama/Llama-3.1-8B-Instruct")` starts a background
+5. `hf_download("meta-llama/Llama-3.1-8B-Instruct")` starts a background
    task that downloads on the login node into `hf_home`.
-5. `job_script_template(command="python train.py")` drafts a script. Save it
+6. `job_script_template(command="python train.py")` drafts a script. Save it
    with `write_file("scripts/train.sh", ...)`.
-6. `submit_job("train_gpu", "scripts/train.sh", overrides={"time": "04:00:00"})`
+7. `submit_job("train_gpu", "scripts/train.sh", overrides={"time": "04:00:00"})`
    submits the job. Add `dry_run=True` first to preview the `sbatch` command.
-7. Check on the job with `job_status`, `tail_job_log`, `list_run_files`,
+8. Check on the job with `job_status`, `tail_job_log`, `list_run_files`,
    `read_file`, `grep_files`, and `download_file`.
 
 ## Tools
+
+**Projects:** `project_use`, `project_list`. Path-based tools below also take
+`project=`.
 
 **Connection and cluster info:** `cluster_login`, `cluster_logout`,
 `cluster_auth_status`, `cluster_preflight`, `remote_whoami`, `list_clusters`,
@@ -131,7 +183,7 @@ Pass `no_index=False` for packages that are only on PyPI.
 
 **Background tasks:** `remote_task_status`, `list_remote_tasks`,
 `cancel_remote_task`. Long login-node work (venv builds, downloads) runs
-detached under `run_root/mcp-tasks/<task_id>/`. That folder holds
+detached under `tasks_root/<task_id>/` (default `run_root/mcp-tasks`). That folder holds
 `task.sh`, `output.log`, and `exit_code`, so status survives reconnects.
 
 **Escape hatch:** `run_remote_command` runs any bash command, but only when
@@ -147,13 +199,16 @@ Profiles in `config.yaml` set `sbatch` options: `time`, `mem`,
 override any of these with `overrides`.
 
 Jobs start with `--export=ALL,...` plus their environment variables, added
-in this order:
+in this order (later ones win):
 
-1. The Hugging Face cache variables (`HF_HOME`, plus the offline flags when
+1. `MCP_PROJECT`, `MCP_REPO_DIR` and `MCP_RUN_DIR`, so a script can write to
+   `$MCP_RUN_DIR/checkpoints` instead of hard-coding paths. The prefix avoids
+   clashing with variables such as `$PROJECT` that some Alliance clusters set.
+2. The Hugging Face cache variables (`HF_HOME`, plus the offline flags when
    compute nodes have no internet).
-2. `slurm.job_env`.
-3. The profile's `env`.
-4. The call's `env`.
+3. `slurm.job_env`.
+4. The profile's `env`.
+5. The call's `env`.
 
 Logs go to `run_root/logs/%x-%j.out` and `%x-%j.err` unless the profile sets
 `output` or `error`.

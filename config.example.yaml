@@ -47,8 +47,9 @@ cluster_defaults:
     # Lmod module that provides Python; extra modules are loaded after it.
     module: python/3.11
     modules: []
-    # Default virtualenv name under storage.venv_root.
-    venv_name: default
+    # Default virtualenv name under storage.venv_root. "{project}" gives each project
+    # its own venv; without a selected project it falls back to "default".
+    venv_name: "{project}"
   setup_hints:
     python_virtualenv:
       - module load python/3.11
@@ -71,8 +72,27 @@ cluster_defaults:
     # Extra environment variables for every job (passed with --export=ALL,...).
     # job_env:
     #   OMP_NUM_THREADS: "1"
+  # Storage paths are templates. Placeholders: {user} and {cluster} from the cluster
+  # entry, {project} from the selected project (project_use or project=...), and
+  # any other storage key, such as {workspace_root} below. Paths that use
+  # {project} resolve per project, so one config serves every project, and a new
+  # project needs no config edit: remote_git_clone or sync_local_commits creates it.
   storage:
     preferred_work_root: scratch
+    # One folder per project. project_list(cluster=...) scans this folder.
+    workspace_root: /project/def-yourpi/{user}/code
+    remote_repo: "{workspace_root}/{project}"
+    # Keep run outputs outside the repo: untracked files there make remote_git_pull
+    # and remote_git_checkout refuse to run. Scratch is large but purged.
+    run_root: /scratch/{user}/runs/{project}
+    # Virtualenvs hold many small files; keep them out of scratch (purged) and
+    # watch the file-count quota wherever you put them.
+    venv_root: /home/{user}/venvs
+    # Shared Hugging Face cache, read by jobs through HF_HOME. Shared on purpose.
+    hf_home: /project/def-yourpi/{user}/hf
+    # Background tasks (setup_venv, hf_download). Without {project} their status
+    # stays readable after switching projects. Defaults to run_root/mcp-tasks.
+    tasks_root: /scratch/{user}/.slurm-mcp/tasks
 
 clusters:
   killarney:
@@ -80,47 +100,40 @@ clusters:
     user: your_cc_username
     docs:
       - https://docs.alliancecan.ca/wiki/Killarney
-    storage:
-      remote_repo: /scratch/your_cc_username/my-paper
-      run_root: /scratch/your_cc_username/my-paper/runs
-      # Virtualenvs hold many small files; keep them out of scratch (purged) and
-      # watch the file-count quota wherever you put them.
-      venv_root: /home/your_cc_username/venvs
-      # Shared Hugging Face cache, read by jobs through HF_HOME.
-      hf_home: /project/def-yourpi/your_cc_username/hf
 
   narval:
     host: narval
     user: your_cc_username
     docs:
       - https://docs.alliancecan.ca/wiki/Narval
-    storage:
-      remote_repo: /scratch/your_cc_username/my-paper
-      run_root: /scratch/your_cc_username/my-paper/runs
-      venv_root: /home/your_cc_username/venvs
-      hf_home: /project/def-yourpi/your_cc_username/hf
 
   trillium:
     host: trillium
     user: your_cc_username
     docs:
       - https://docs.alliancecan.ca/wiki/Trillium
-    storage:
-      remote_repo: /scratch/your_cc_username/my-paper
-      run_root: /scratch/your_cc_username/my-paper/runs
-      venv_root: /home/your_cc_username/venvs
-      hf_home: /project/def-yourpi/your_cc_username/hf
 
   vulcan:
     host: vulcan
     user: your_cc_username
     docs:
       - https://docs.alliancecan.ca/wiki/Vulcan
-    storage:
-      remote_repo: /scratch/your_cc_username/my-paper
-      run_root: /scratch/your_cc_username/my-paper/runs
-      venv_root: /home/your_cc_username/venvs
-      hf_home: /project/def-yourpi/your_cc_username/hf
+    # A cluster can override any storage template, e.g. a different allocation:
+    # storage:
+    #   workspace_root: /project/def-otherpi/{user}/code
+
+# Project selected when the server starts. project_use switches at runtime.
+# default_project: my-paper
+
+# Optional per-project settings. Projects do not need to be listed here; list one
+# to describe it or to point it at a checkout that does not follow the templates.
+# projects:
+#   old-paper:
+#     description: Camera-ready runs for the 2025 paper.
+#     clusters:
+#       narval:
+#         storage:
+#           remote_repo: /project/def-yourpi/{user}/old-paper
 
 profiles:
   debug_gpu:

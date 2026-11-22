@@ -320,6 +320,141 @@ class LocalToolTests(unittest.TestCase):
             server.run_remote_command("echo hi")
 
 
+@unittest.skipIf(BASH is None, "needs a POSIX bash")
+class ProjectToolTests(unittest.TestCase):
+    """Several projects on one cluster through {project} storage templates."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name).resolve()
+        self.local = self.tmp / "local"
+        self.remote = self.tmp / "remote"
+        self.shims = self.tmp / "shims"
+        for path in (self.local, self.remote, self.shims):
+            path.mkdir(parents=True)
+        setsid = self.shims / "setsid"
+        setsid.write_text('#!/bin/bash\nexec "$@"\n', encoding="utf-8", newline="\n")
+        setsid.chmod(0o755)
+
+        base = _posix(self.remote)
+        config = {
+            "default_cluster": "local",
+            "audit_log": None,
+            "local_roots": [str(self.local)],
+            "cluster_defaults": {
+                "python": {"venv_name": "{project}"},
+                "storage": {
+                    "workspace_root": base + "/projects",
+                    "remote_repo": "{workspace_root}/{project}",
+                    "run_root": base + "/runs/{project}",
+                    "venv_root": base + "/venvs",
+                    "hf_home": base + "/hf",
+                    "tasks_root": base + "/tasks",
+                },
+            },
+            "clusters": {
+                "local": {"host": "localhost", "user": "tester"},
+                "fixed": {
+                    "host": "localhost",
+                    "user": "tester",
+                    "storage": {"remote_repo": base + "/fixed", "run_root": base + "/fixed-runs"},
+                },
+            },
+            "profiles": {"cpu": {"time": "00:10:00"}},
+        }
+        config_path = self.tmp / "config.yaml"
+        config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        self.backend = LocalBackend(self.shims)
+        server.settings = load_settings(config_path)
+        server.backend = self.backend
+        server.active_project = server._UNSET
+
+    def tearDown(self) -> None:
+        server.settings = None
+        server.backend = None
+        server.active_project = server._UNSET
+        self._tmp.cleanup()
+
+    def test_tools_need_a_project_when_paths_use_it(self) -> None:
+        with self.assertRaisesRegex(ValueError, "No project selected"):
+            server.remote_git_status()
+        with self.assertRaisesRegex(ValueError, "No project selected"):
+            server.submit_job("cpu", "job.sh", dry_run=True)
+
+    def test_projects_are_isolated_and_active_project_is_the_default(self) -> None:
+        server.write_file("notes.txt", "alpha\n", project="alpha")
+        server.project_use("beta")
+        server.write_file("notes.txt", "beta\n")
+        self.assertEqual((self.remote / "projects" / "alpha" / "notes.txt").read_text(), "alpha\n")
+        self.assertEqual((self.remote / "projects" / "beta" / "notes.txt").read_text(), "beta\n")
+        self.assertEqual(server.read_file("notes.txt", base="remote_repo")["content"], "beta\n")
+        self.assertEqual(server.read_file("notes.txt", base="remote_repo", project="alpha")["content"], "alpha\n")
+        with self.assertRaises(ValueError):
+            server.write_file("x.txt", "x", project="../alpha")
+
+    def test_submit_job_exports_project_paths(self) -> None:
+        preview = server.submit_job("cpu", "train.sh", project="alpha", dry_run=True)
+        self.assertEqual(preview["project"], "alpha")
+        self.assertEqual(preview["log_dir"], _posix(self.remote) + "/runs/alpha/logs")
+        self.assertEqual(preview["env"]["MCP_PROJECT"], "alpha")
+        self.assertEqual(preview["env"]["MCP_REPO_DIR"], _posix(self.remote) + "/projects/alpha")
+        self.assertEqual(preview["env"]["MCP_RUN_DIR"], _posix(self.remote) + "/runs/alpha")
+
+    def test_project_on_cluster_without_templates(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not change any path"):
+            server.remote_git_status(cluster="fixed", project="alpha")
+        # The active project is ignored there instead of failing.
+        server.project_use("alpha")
+        (self.remote / "fixed").mkdir()
+        written = server.write_file("a.txt", "x", cluster="fixed")
+        self.assertEqual(written["path"], _posix(self.remote) + "/fixed/a.txt")
+
+    def test_project_use_and_list(self) -> None:
+        used = server.project_use("alpha")
+        self.assertEqual(used["active_project"], "alpha")
+        self.assertEqual(used["clusters"]["local"]["paths"]["remote_repo"], _posix(self.remote) + "/projects/alpha")
+        self.assertFalse(used["clusters"]["fixed"]["project_applies"])
+
+        (self.remote / "projects" / "beta").mkdir(parents=True)
+        _git(self.remote / "projects", "init", "-q", "alpha")
+        listed = server.project_list(cluster="local")
+        self.assertEqual(listed["active_project"], "alpha")
+        self.assertEqual(
+            sorted((p["name"], p["git"]) for p in listed["found"]),
+            [("alpha", True), ("beta", False)],
+        )
+        self.assertIsNone(server.project_list(cluster="fixed")["workspace"])
+
+        self.assertIsNone(server.project_use(None)["active_project"])
+
+    def test_background_tasks_are_shared_across_projects(self) -> None:
+        target, roots, _ = server._env_context(server.get_settings(), None, "alpha")
+        task = server._launch_task(server.get_settings(), target, roots, "demo", "echo done", "demo")
+        self.assertTrue(task["task_dir"].startswith(_posix(self.remote) + "/tasks/"))
+        status: dict[str, Any] = {}
+        for _ in range(100):
+            # No project needed: tasks_root is not project-scoped.
+            status = server.remote_task_status(task["task_id"])
+            if status["state"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.1)
+        self.assertEqual(status["state"], "succeeded")
+
+    def test_default_venv_name_follows_project(self) -> None:
+        info = server.venv_info(project="alpha")
+        self.assertEqual(info["venv"], _posix(self.remote) + "/venvs/alpha")
+        self.assertEqual(server.venv_info()["venv"], _posix(self.remote) + "/venvs/default")
+
+    def test_download_path_includes_project(self) -> None:
+        (self.remote / "runs" / "alpha").mkdir(parents=True)
+        (self.remote / "runs" / "alpha" / "out.txt").write_text("ok\n", encoding="utf-8")
+        result = server.download_file("out.txt", project="alpha")
+        self.assertEqual(
+            Path(result["local_path"]),
+            self.local / "slurm-mcp-downloads" / "local" / "alpha" / "run_root" / "out.txt",
+        )
+
+
 class RecordingBackend:
     name = "recording"
 

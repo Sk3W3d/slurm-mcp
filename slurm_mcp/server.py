@@ -15,7 +15,7 @@ from . import huggingface as hf
 from . import python_env
 from . import remote_tasks
 from .audit import preview_text, write_audit_event
-from .config import Cluster, Settings, load_settings
+from .config import Cluster, NeedsProject, Settings, expand_template, load_settings, validate_project_name
 from .local_files import check_transfer_size, local_git_ok, resolve_local_path, run_local_git
 from .remote_files import (
     REQUIRED_ROOT_KEYS,
@@ -24,6 +24,7 @@ from .remote_files import (
     find_job_logs_argv,
     grep_files_argv,
     list_files_argv,
+    normalize_remote_root,
     parse_file_listing,
     parse_grep_output,
     parse_stat_output,
@@ -87,11 +88,21 @@ mcp = FastMCP("alliance-slurm")
 settings: Settings | None = None
 backend: SSHBackend | None = None
 
+_UNSET = object()
+# Project selected with project_use. _UNSET means "use settings.default_project".
+active_project: Any = _UNSET
+
 
 def get_settings() -> Settings:
     if settings is None:
         raise RuntimeError("Server settings are not initialized.")
     return settings
+
+
+def get_active_project() -> str | None:
+    if active_project is _UNSET:
+        return get_settings().default_project
+    return active_project
 
 
 def get_backend() -> SSHBackend:
@@ -121,9 +132,120 @@ def list_clusters() -> list[str]:
 
 
 @mcp.tool()
-def cluster_info(cluster: str | None = None) -> dict[str, object]:
-    """Return structured cluster configuration, policies, and setup hints."""
-    return get_settings().cluster_info(cluster)
+def cluster_info(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
+    """Return structured cluster configuration, policies, and setup hints.
+
+    Storage paths are resolved for the given project, or the active one.
+    storage_pending_project lists paths that need a project to resolve.
+    """
+    current_settings = get_settings()
+    name = validate_project_name(project) if project else get_active_project()
+    return current_settings.cluster_info(cluster, project=name)
+
+
+_PROJECT_PATH_KEYS = ("remote_repo", "run_root", "venv_root", "hf_home", "tasks_root")
+
+
+def _project_paths(settings: Settings, project: str | None) -> dict[str, dict[str, object]]:
+    """Resolved storage paths for a project on every cluster, computed locally (no SSH)."""
+    paths: dict[str, dict[str, object]] = {}
+    for name in sorted(settings.clusters):
+        info = settings.cluster_info(name, project=project)
+        storage = info["storage"]
+        paths[name] = {
+            "project_applies": info["project_applies"],
+            "paths": {key: storage[key] for key in _PROJECT_PATH_KEYS if key in storage},
+            "pending_project": info["storage_pending_project"],
+        }
+    return paths
+
+
+@mcp.tool()
+def project_use(project: str | None = None) -> dict[str, object]:
+    """Select the active project; tools without an explicit project= argument use it.
+
+    Any valid name works; it does not need to be listed under 'projects' in the
+    config. Paths are built from the storage templates (for example
+    remote_repo: /scratch/{user}/projects/{project}). Pass null to clear it.
+    The selection lasts until the MCP server restarts, then default_project
+    applies again. Returns where the project lives on each cluster.
+    """
+    global active_project
+    current_settings = get_settings()
+    name = validate_project_name(project) if project else None
+    if name is not None and not any(
+        current_settings.cluster_info(cluster, project=name)["project_applies"] for cluster in current_settings.clusters
+    ):
+        raise ValueError(
+            f"Project '{name}' would not change any path: no cluster storage uses {{project}} and the project has "
+            "no storage overrides. Add {project} to the storage templates in config.yaml."
+        )
+    active_project = name
+    spec = current_settings.projects.get(name) if name else None
+    return {
+        "active_project": name,
+        "configured": spec is not None,
+        "description": spec.description if spec else None,
+        "clusters": _project_paths(current_settings, name),
+    }
+
+
+@mcp.tool()
+def project_list(cluster: str | None = None) -> dict[str, object]:
+    """List projects: the active one, those configured in config.yaml, and (with cluster) those found on it.
+
+    With cluster set, lists the directories next to where remote_repo would be
+    for a project (the parent of the {project} folder) and marks which are Git
+    repositories. That remote scan needs a connection; without cluster this
+    call runs locally only.
+    """
+    current_settings = get_settings()
+    result: dict[str, object] = {
+        "active_project": get_active_project(),
+        "default_project": current_settings.default_project,
+        "configured": [
+            {"name": spec.name, "description": spec.description, "clusters_with_overrides": sorted(spec.clusters or {})}
+            for spec in sorted(current_settings.projects.values(), key=lambda spec: spec.name)
+        ],
+    }
+    if cluster is None:
+        return result
+
+    target = current_settings.get_cluster(cluster)
+    workspace = _project_workspace(current_settings, target)
+    result["cluster"] = target.name
+    result["workspace"] = workspace
+    if workspace is None:
+        result["found"] = []
+        result["note"] = "storage.remote_repo on this cluster does not end in /{project}, so there is no folder to scan."
+        return result
+    script = (
+        'shopt -s nullglob; cd -- "$1" 2>/dev/null || exit 0; '
+        'for d in */; do d=${d%/}; if [ -e "$d/.git" ]; then echo "git $d"; else echo "dir $d"; fi; done'
+    )
+    output = _run_remote_output(
+        current_settings, target, ["bash", "-c", script, "_", workspace], tool="project_list", timeout=30, strip=False
+    )
+    found = []
+    for line in output.splitlines():
+        kind, _, name = line.partition(" ")
+        if name:
+            found.append({"name": name, "git": kind == "git", "configured": name in current_settings.projects})
+    result["found"] = found
+    return result
+
+
+_PROBE_PROJECT = "slurm-mcp-probe"
+
+
+def _project_workspace(settings: Settings, target: Cluster) -> str | None:
+    """Folder that holds one directory per project, if remote_repo is '<folder>/{project}'."""
+    storage = settings.storage_for(target.name, _PROBE_PROJECT).values
+    repo = storage.get("remote_repo")
+    suffix = "/" + _PROBE_PROJECT
+    if not repo or not repo.endswith(suffix) or _PROBE_PROJECT in repo[: -len(suffix)]:
+        return None
+    return normalize_remote_root(repo[: -len(suffix)], "workspace")
 
 
 @mcp.tool()
@@ -309,24 +431,23 @@ def submit_job(
     overrides: dict[str, Any] | None = None,
     env: dict[str, str] | None = None,
     dry_run: bool = False,
+    project: str | None = None,
 ) -> dict[str, object]:
-    """Submit a Slurm job using a configured profile and a script under remote_repo.
+    """Submit a Slurm job using a configured profile and a script under the project's remote_repo.
 
     overrides replaces profile keys for this submission only (for example
     {"time": "02:00:00", "gpus": 2, "array": "0-9", "dependency": "afterok:123"}).
     env adds variables via --export=ALL,...; when storage.hf_home is set, HF_HOME
     and (on clusters without compute-node internet) the HF offline flags are
-    added automatically. Use dry_run=True to preview the exact sbatch argv.
+    added automatically. The job also gets MCP_PROJECT, MCP_REPO_DIR and
+    MCP_RUN_DIR. Use dry_run=True to preview the exact sbatch argv.
     """
     current_settings = get_settings()
-    target = current_settings.get_cluster(cluster)
-    info = current_settings.cluster_info(cluster)
-    storage = info.get("storage", {})
-    if not isinstance(storage, dict):
-        raise ValueError("Cluster storage configuration must be a mapping.")
-    remote_repo = storage.get("remote_repo") or target.remote_repo
-    run_root = storage.get("run_root") or target.run_root
-    if not isinstance(remote_repo, str) or not remote_repo:
+    target, info = _cluster_context(current_settings, cluster, project)
+    roots = _roots(current_settings, target, info, require_project=True)
+    remote_repo = roots.get("remote_repo")
+    run_root = roots.get("run_root")
+    if not remote_repo:
         raise ValueError("Cluster must define storage.remote_repo before jobs can be submitted.")
 
     slurm_info = info.get("slurm", {})
@@ -363,6 +484,7 @@ def submit_job(
     preview = {
         "cluster": target.name,
         "host": target.host,
+        "project": roots.project,
         "profile": profile,
         "script": safe_script,
         "remote_repo": remote_repo,
@@ -505,10 +627,11 @@ def list_run_files(
     path: str | None = None,
     limit: int = 100,
     max_depth: int = 4,
+    project: str | None = None,
 ) -> dict[str, object]:
     """List files under the configured run_root, newest first."""
     current_settings = get_settings()
-    target, roots = _file_context(current_settings, cluster)
+    target, roots = _file_context(current_settings, cluster, project)
     safe_limit = validate_limit(limit)
     safe_depth = validate_max_depth(max_depth)
     resolved = resolve_remote_path(path, roots, base="run_root", label="path")
@@ -540,10 +663,11 @@ def read_file(
     cluster: str | None = None,
     max_bytes: int = 20000,
     base: str = "run_root",
+    project: str | None = None,
 ) -> dict[str, object]:
     """Read the beginning of an allowlisted remote text file."""
     current_settings = get_settings()
-    target, roots = _file_context(current_settings, cluster)
+    target, roots = _file_context(current_settings, cluster, project)
     safe_base = validate_file_base(base)
     safe_max_bytes = validate_max_bytes(max_bytes)
     resolved = resolve_remote_path(path, roots, base=safe_base, label="path")
@@ -583,10 +707,11 @@ def tail_file(
     cluster: str | None = None,
     lines: int = 100,
     base: str = "run_root",
+    project: str | None = None,
 ) -> dict[str, object]:
     """Tail an allowlisted remote text file."""
     current_settings = get_settings()
-    target, roots = _file_context(current_settings, cluster)
+    target, roots = _file_context(current_settings, cluster, project)
     safe_base = validate_file_base(base)
     safe_lines = validate_line_count(lines)
     resolved = resolve_remote_path(path, roots, base=safe_base, label="path")
@@ -616,10 +741,11 @@ def grep_files(
     cluster: str | None = None,
     limit: int = 50,
     base: str = "run_root",
+    project: str | None = None,
 ) -> dict[str, object]:
     """Search allowlisted remote files with fixed-string grep."""
     current_settings = get_settings()
-    target, roots = _file_context(current_settings, cluster)
+    target, roots = _file_context(current_settings, cluster, project)
     safe_base = validate_file_base(base)
     safe_limit = validate_limit(limit)
     resolved = resolve_remote_path(path, roots, base=safe_base, label="path")
@@ -646,10 +772,15 @@ def grep_files(
 
 
 @mcp.tool()
-def job_logs(job_id: str, cluster: str | None = None, limit: int = 20) -> dict[str, object]:
-    """Find stdout/stderr log files for a Slurm job under run_root."""
+def job_logs(
+    job_id: str,
+    cluster: str | None = None,
+    limit: int = 20,
+    project: str | None = None,
+) -> dict[str, object]:
+    """Find stdout/stderr log files for a Slurm job under the project's run_root."""
     current_settings = get_settings()
-    target, roots = _file_context(current_settings, cluster)
+    target, roots = _file_context(current_settings, cluster, project)
     safe_job_id = validate_job_id(job_id)
     safe_limit = validate_limit(limit)
     files = _job_log_files(current_settings, target, roots, safe_job_id, safe_limit)
@@ -668,10 +799,11 @@ def tail_job_log(
     stream: str = "stdout",
     cluster: str | None = None,
     lines: int = 100,
+    project: str | None = None,
 ) -> dict[str, object]:
     """Tail the stdout or stderr log file for a Slurm job."""
     current_settings = get_settings()
-    target, roots = _file_context(current_settings, cluster)
+    target, roots = _file_context(current_settings, cluster, project)
     safe_job_id = validate_job_id(job_id)
     safe_lines = validate_line_count(lines)
     files = _job_log_files(current_settings, target, roots, safe_job_id, limit=20)
@@ -708,6 +840,7 @@ def write_file(
     base: str = "remote_repo",
     overwrite: bool = False,
     executable: bool = False,
+    project: str | None = None,
 ) -> dict[str, object]:
     """Write a text file (such as a Slurm job script) inside an allowlisted remote root.
 
@@ -715,7 +848,7 @@ def write_file(
     replace an existing file unless overwrite=True.
     """
     current_settings = get_settings()
-    target, roots = _file_context(current_settings, cluster)
+    target, roots = _file_context(current_settings, cluster, project)
     resolved = resolve_remote_path(path, roots, base=validate_file_base(base), label="path")
     if not resolved.relative:
         raise ValueError("path must name a file inside the root, not the root itself.")
@@ -750,10 +883,11 @@ def upload_file(
     cluster: str | None = None,
     base: str = "remote_repo",
     overwrite: bool = False,
+    project: str | None = None,
 ) -> dict[str, object]:
     """Copy a local file (inside local_roots) to an allowlisted remote root."""
     current_settings = get_settings()
-    target, roots = _file_context(current_settings, cluster)
+    target, roots = _file_context(current_settings, cluster, project)
     source = resolve_local_path(local_path, current_settings.local_root_paths(), label="local_path")
     if not source.is_file():
         raise ValueError(f"Local file not found: {source}")
@@ -798,20 +932,26 @@ def download_file(
     cluster: str | None = None,
     base: str = "run_root",
     overwrite: bool = False,
+    project: str | None = None,
 ) -> dict[str, object]:
     """Copy a remote file from an allowlisted root to the local machine.
 
-    Without local_path, the file lands in <first local root>/slurm-mcp-downloads/<cluster>/<root>/<relative path>.
+    Without local_path, the file lands in
+    <first local root>/slurm-mcp-downloads/<cluster>/[<project>/]<root>/<relative path>.
     """
     current_settings = get_settings()
-    target, roots = _file_context(current_settings, cluster)
+    target, roots = _file_context(current_settings, cluster, project)
     resolved = resolve_remote_path(remote_path, roots, base=validate_file_base(base), label="remote_path")
     local_roots = current_settings.local_root_paths()
     if local_path:
         destination = resolve_local_path(local_path, local_roots, label="local_path")
     else:
         destination = resolve_local_path(
-            "/".join(["slurm-mcp-downloads", target.name, resolved.root_name, resolved.relative or "root"]),
+            "/".join(
+                ["slurm-mcp-downloads", target.name]
+                + ([roots.project] if roots.project else [])
+                + [resolved.root_name, resolved.relative or "root"]
+            ),
             local_roots,
             label="local_path",
         )
@@ -845,10 +985,14 @@ def download_file(
 
 
 @mcp.tool()
-def cluster_preflight(cluster: str | None = None, write_check: bool = False) -> dict[str, object]:
+def cluster_preflight(
+    cluster: str | None = None,
+    write_check: bool = False,
+    project: str | None = None,
+) -> dict[str, object]:
     """Check whether a configured cluster/project is ready for agent workflows."""
     current_settings = get_settings()
-    target = current_settings.get_cluster(cluster)
+    target, info = _cluster_context(current_settings, cluster, project)
     checks: list[dict[str, object]] = []
 
     auth_result = get_backend().check(target.host)
@@ -863,21 +1007,18 @@ def cluster_preflight(cluster: str | None = None, write_check: bool = False) -> 
         }
     )
 
-    info = current_settings.cluster_info(target.name)
-    storage = info.get("storage", {})
     roots: dict[str, str] = {}
     storage_ok = False
     try:
-        if not isinstance(storage, dict):
-            raise ValueError("Cluster storage configuration must be a mapping.")
-        roots = allowed_roots_from_storage(storage)
+        roots = _roots(current_settings, target, info, require_project=True)
         storage_ok = True
         checks.append(
             {
                 "name": "storage_config",
                 "ok": True,
                 "required": True,
-                "roots": roots,
+                "project": info.get("project"),
+                "roots": dict(roots),
             }
         )
     except ValueError as exc:
@@ -1016,10 +1157,10 @@ def cluster_preflight(cluster: str | None = None, write_check: bool = False) -> 
 
 
 @mcp.tool()
-def remote_git_status(cluster: str | None = None) -> dict[str, object]:
-    """Return structured Git status for the configured remote repository."""
+def remote_git_status(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
+    """Return structured Git status for the project's remote repository."""
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster)
+    target, remote_repo = _repo_context(current_settings, cluster, project)
     output = _run_remote_output(
         current_settings,
         target,
@@ -1037,10 +1178,10 @@ def remote_git_status(cluster: str | None = None) -> dict[str, object]:
 
 
 @mcp.tool()
-def remote_git_rev(cluster: str | None = None) -> dict[str, object]:
-    """Return the current full and short Git commit for the configured remote repository."""
+def remote_git_rev(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
+    """Return the current full and short Git commit for the project's remote repository."""
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster)
+    target, remote_repo = _repo_context(current_settings, cluster, project)
     full = _run_remote_output(
         current_settings,
         target,
@@ -1065,10 +1206,10 @@ def remote_git_rev(cluster: str | None = None) -> dict[str, object]:
 
 
 @mcp.tool()
-def remote_git_branch(cluster: str | None = None) -> dict[str, object]:
-    """Return the current Git branch for the configured remote repository."""
+def remote_git_branch(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
+    """Return the current Git branch for the project's remote repository."""
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster)
+    target, remote_repo = _repo_context(current_settings, cluster, project)
     branch = _run_remote_output(
         current_settings,
         target,
@@ -1086,10 +1227,14 @@ def remote_git_branch(cluster: str | None = None) -> dict[str, object]:
 
 
 @mcp.tool()
-def remote_git_pull(cluster: str | None = None, dry_run: bool = True) -> dict[str, object]:
-    """Dry-run or perform a fast-forward-only Git pull in the configured remote repository."""
+def remote_git_pull(
+    cluster: str | None = None,
+    dry_run: bool = True,
+    project: str | None = None,
+) -> dict[str, object]:
+    """Dry-run or perform a fast-forward-only Git pull in the project's remote repository."""
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster)
+    target, remote_repo = _repo_context(current_settings, cluster, project)
     before_status_output = _run_remote_output(
         current_settings,
         target,
@@ -1173,10 +1318,10 @@ def remote_git_pull(cluster: str | None = None, dry_run: bool = True) -> dict[st
 
 
 @mcp.tool()
-def remote_git_fetch(cluster: str | None = None) -> dict[str, object]:
+def remote_git_fetch(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Fetch (git fetch --prune) in the remote repository without touching the working tree."""
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster)
+    target, remote_repo = _repo_context(current_settings, cluster, project)
     result = _run_remote_result(
         current_settings, target, git_fetch_argv(remote_repo), tool="remote_git_fetch", timeout=300
     )
@@ -1191,10 +1336,10 @@ def remote_git_fetch(cluster: str | None = None) -> dict[str, object]:
 
 
 @mcp.tool()
-def remote_git_checkout(ref: str, cluster: str | None = None) -> dict[str, object]:
+def remote_git_checkout(ref: str, cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Check out a branch, tag, or commit in the remote repository (refuses if it has uncommitted changes)."""
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster)
+    target, remote_repo = _repo_context(current_settings, cluster, project)
     safe_ref = validate_git_ref(ref)
     status = _remote_git_status(current_settings, target, remote_repo, "remote_git_checkout")
     if not status["clean"]:
@@ -1217,14 +1362,21 @@ def remote_git_checkout(ref: str, cluster: str | None = None) -> dict[str, objec
 
 
 @mcp.tool()
-def remote_git_clone(url: str, cluster: str | None = None, branch: str | None = None) -> dict[str, object]:
-    """Clone a Git repository into the configured storage.remote_repo (which must not exist yet).
+def remote_git_clone(
+    url: str,
+    cluster: str | None = None,
+    branch: str | None = None,
+    project: str | None = None,
+) -> dict[str, object]:
+    """Clone a Git repository into the project's storage.remote_repo (which must not exist yet).
+
+    With a {project} template, cloning is how a new project is created on a cluster.
 
     The cluster needs read access to the URL: a public https URL, or an SSH
     URL for which the cluster account has a deploy key.
     """
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster)
+    target, remote_repo = _repo_context(current_settings, cluster, project)
     argv = git_clone_argv(url, remote_repo, branch)
     exists = _run_remote_result(
         current_settings, target, ["test", "-e", remote_repo], tool="remote_git_clone", timeout=15
@@ -1255,6 +1407,7 @@ def sync_local_commits(
     cluster: str | None = None,
     checkout: bool = True,
     init_if_missing: bool = True,
+    project: str | None = None,
 ) -> dict[str, object]:
     """Send committed local work to the remote repository without going through GitHub.
 
@@ -1265,7 +1418,7 @@ def sync_local_commits(
     remote branch has diverged, it fails instead of overwriting.
     """
     current_settings = get_settings()
-    target, remote_repo = _repo_context(current_settings, cluster)
+    target, remote_repo = _repo_context(current_settings, cluster, project)
     repo = resolve_local_path(local_repo, current_settings.local_root_paths(), label="local_repo")
     repo = Path(run_local_git(repo, ["rev-parse", "--show-toplevel"]))
     safe_branch = validate_git_ref(branch or run_local_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "branch")
@@ -1385,6 +1538,7 @@ def setup_venv(
     extra_modules: list[str] | None = None,
     no_index: bool = True,
     recreate: bool = False,
+    project: str | None = None,
 ) -> dict[str, object]:
     """Create or update a Python virtualenv on the cluster, Alliance style, as a background task.
 
@@ -1393,12 +1547,14 @@ def setup_venv(
     --no-index so wheels come from the Alliance wheelhouse. Set no_index=False
     for packages that are only on PyPI. requirements is relative to
     remote_repo (pass null to skip it). Returns a task_id; poll it with
-    remote_task_status. The venv lands in storage.venv_root/<name>.
+    remote_task_status. The venv lands in storage.venv_root/<name>; the
+    default name is python.venv_name, which may use {project}.
     """
     current_settings = get_settings()
-    target, storage, python_config = _env_context(current_settings, cluster)
+    # A requirements file lives in remote_repo, which usually needs a project; a package list does not.
+    target, storage, python_config = _env_context(current_settings, cluster, project, require_project=bool(requirements))
     venv_root = _required_storage(storage, "venv_root", "virtualenv tools")
-    venv = python_env.venv_path(venv_root, name or str(python_config.get("venv_name") or "default"))
+    venv = python_env.venv_path(venv_root, name or _default_venv_name(target, python_config, storage.project))
     modules = python_env.resolve_modules(python_config, python_module, extra_modules)
     if requirements:
         requirements = validate_remote_relative_path(requirements, "requirements")
@@ -1421,12 +1577,12 @@ def setup_venv(
 
 
 @mcp.tool()
-def venv_info(cluster: str | None = None, name: str | None = None) -> dict[str, object]:
+def venv_info(cluster: str | None = None, name: str | None = None, project: str | None = None) -> dict[str, object]:
     """Show whether a virtualenv exists, its modules, installed packages, and how to activate it in a job."""
     current_settings = get_settings()
-    target, storage, python_config = _env_context(current_settings, cluster)
+    target, storage, python_config = _env_context(current_settings, cluster, project, require_project=False)
     venv_root = _required_storage(storage, "venv_root", "virtualenv tools")
-    venv = python_env.venv_path(venv_root, name or str(python_config.get("venv_name") or "default"))
+    venv = python_env.venv_path(venv_root, name or _default_venv_name(target, python_config, storage.project))
     output = _run_remote_output(
         current_settings, target, python_env.inspect_venv_argv(venv), tool="venv_info", timeout=30, strip=False
     )
@@ -1471,6 +1627,7 @@ def hf_download(
     allow_patterns: list[str] | None = None,
     ignore_patterns: list[str] | None = None,
     venv: str | None = None,
+    project: str | None = None,
 ) -> dict[str, object]:
     """Download a Hugging Face model or dataset into the shared HF_HOME cache, as a background task.
 
@@ -1479,10 +1636,11 @@ def hf_download(
     get HF_HOME and the offline flags. Gated models need a token on the
     cluster first (hf_store_token). By default a small helper virtualenv with
     huggingface_hub is created under venv_root; pass venv to use one of yours.
-    Returns a task_id for remote_task_status.
+    Returns a task_id for remote_task_status. Needs no project unless
+    hf_home, venv_root, or the tasks folder are project-scoped.
     """
     current_settings = get_settings()
-    target, storage, python_config = _env_context(current_settings, cluster)
+    target, storage, python_config = _env_context(current_settings, cluster, project, require_project=False)
     hf_home = _required_storage(storage, "hf_home", "Hugging Face tools")
     venv_root = _required_storage(storage, "venv_root", "Hugging Face tools")
     body = hf.build_download_script(
@@ -1502,35 +1660,34 @@ def hf_download(
 
 
 @mcp.tool()
-def hf_cache_list(cluster: str | None = None) -> dict[str, object]:
+def hf_cache_list(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """List models and datasets already cached in the cluster's shared HF_HOME."""
     current_settings = get_settings()
-    target, storage, _ = _env_context(current_settings, cluster)
+    target, storage, _ = _env_context(current_settings, cluster, project, require_project=False)
     hf_home = _required_storage(storage, "hf_home", "Hugging Face tools")
     output = _run_remote_output(
         current_settings, target, hf.cache_list_argv(hf_home), tool="hf_cache_list", timeout=60, strip=False
     )
     entries = hf.parse_cache_list(output)
-    info = current_settings.cluster_info(target.name)
     return {
         "cluster": target.name,
         "host": target.host,
         "hf_home": hf_home,
         "count": len(entries),
         "entries": entries,
-        "job_env": _job_env(info, None, None),
+        "job_env": _job_env(storage.info, None, None),
     }
 
 
 @mcp.tool()
-def hf_store_token(cluster: str | None = None) -> dict[str, object]:
+def hf_store_token(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Copy the HF_TOKEN environment variable of this MCP server to $HF_HOME/token on the cluster.
 
     Needed once per cluster for gated or private models. The token is sent over
     stdin and is never returned or written to the audit log.
     """
     current_settings = get_settings()
-    target, storage, _ = _env_context(current_settings, cluster)
+    target, storage, _ = _env_context(current_settings, cluster, project, require_project=False)
     hf_home = _required_storage(storage, "hf_home", "Hugging Face tools")
     token = os.environ.get("HF_TOKEN", "").strip()
     if not token:
@@ -1554,15 +1711,19 @@ def job_script_template(
     profile: str | None = None,
     command: str = "python train.py",
     venv: str | None = None,
+    project: str | None = None,
 ) -> dict[str, object]:
     """Draft a Slurm batch script that loads modules, activates the venv, sets HF cache vars, and cds into the repo.
 
     Resource flags come from the profile at submit time, so the script only
     carries the environment setup. Save it with write_file, then submit_job.
+    Jobs also get MCP_PROJECT, MCP_REPO_DIR and MCP_RUN_DIR, so scripts can
+    write outputs to $MCP_RUN_DIR instead of hard-coding paths.
     """
     current_settings = get_settings()
-    target = current_settings.get_cluster(cluster)
-    info = current_settings.cluster_info(target.name)
+    target, info = _cluster_context(current_settings, cluster, project)
+    if "remote_repo" in (info.get("storage_pending_project") or []):
+        raise _needs_project_error(current_settings, target, ["remote_repo"])
     storage = info.get("storage") if isinstance(info.get("storage"), dict) else {}
     python_config = info.get("python") if isinstance(info.get("python"), dict) else {}
     if profile:
@@ -1575,7 +1736,7 @@ def job_script_template(
     modules = python_env.resolve_modules(python_config, None, None)
     venv_root = storage.get("venv_root")
     if venv_root:
-        venv_path = python_env.venv_path(venv_root, venv or str(python_config.get("venv_name") or "default"))
+        venv_path = python_env.venv_path(venv_root, venv or _default_venv_name(target, python_config, info.get("project")))
         lines.append(python_env.activation_snippet(venv_path, modules))
     else:
         lines.extend(python_env.module_load_lines(modules))
@@ -1594,12 +1755,16 @@ def job_script_template(
 
 
 @mcp.tool()
-def remote_task_status(task_id: str, cluster: str | None = None, lines: int = 60) -> dict[str, object]:
+def remote_task_status(
+    task_id: str,
+    cluster: str | None = None,
+    lines: int = 60,
+    project: str | None = None,
+) -> dict[str, object]:
     """Check a background task (setup_venv, hf_download): state, exit code, and the tail of its log."""
     current_settings = get_settings()
-    target, storage, _ = _env_context(current_settings, cluster)
-    run_root = _required_storage(storage, "run_root", "background tasks")
-    directory = remote_tasks.task_dir(run_root, task_id)
+    target, storage, _ = _env_context(current_settings, cluster, project, require_project=False)
+    directory = _task_dir(storage, task_id)
     output = _run_remote_output(
         current_settings,
         target,
@@ -1618,15 +1783,14 @@ def remote_task_status(task_id: str, cluster: str | None = None, lines: int = 60
 
 
 @mcp.tool()
-def list_remote_tasks(cluster: str | None = None, limit: int = 20) -> dict[str, object]:
+def list_remote_tasks(cluster: str | None = None, limit: int = 20, project: str | None = None) -> dict[str, object]:
     """List background tasks started by this server on a cluster, newest first."""
     current_settings = get_settings()
-    target, storage, _ = _env_context(current_settings, cluster)
-    run_root = _required_storage(storage, "run_root", "background tasks")
+    target, storage, _ = _env_context(current_settings, cluster, project, require_project=False)
     output = _run_remote_output(
         current_settings,
         target,
-        remote_tasks.list_tasks_argv(remote_tasks.tasks_root(run_root)),
+        remote_tasks.list_tasks_argv(_tasks_root(storage)),
         tool="list_remote_tasks",
         timeout=30,
         strip=False,
@@ -1636,15 +1800,14 @@ def list_remote_tasks(cluster: str | None = None, limit: int = 20) -> dict[str, 
 
 
 @mcp.tool()
-def cancel_remote_task(task_id: str, cluster: str | None = None) -> dict[str, object]:
+def cancel_remote_task(task_id: str, cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Stop a running background task (only works from the login node it runs on)."""
     current_settings = get_settings()
-    target, storage, _ = _env_context(current_settings, cluster)
-    run_root = _required_storage(storage, "run_root", "background tasks")
+    target, storage, _ = _env_context(current_settings, cluster, project, require_project=False)
     result = _run_remote_result(
         current_settings,
         target,
-        remote_tasks.cancel_task_argv(remote_tasks.task_dir(run_root, task_id)),
+        remote_tasks.cancel_task_argv(_task_dir(storage, task_id)),
         tool="cancel_remote_task",
         timeout=30,
     )
@@ -1662,6 +1825,7 @@ def run_remote_command(
     cluster: str | None = None,
     cwd_base: str = "remote_repo",
     timeout: int = 120,
+    project: str | None = None,
 ) -> dict[str, object]:
     """Run an arbitrary bash command on the login node. Disabled unless allow_remote_shell: true.
 
@@ -1675,7 +1839,7 @@ def run_remote_command(
         raise ValueError("command must be a non-empty string.")
     if not isinstance(timeout, int) or timeout < 1 or timeout > 600:
         raise ValueError("timeout must be between 1 and 600 seconds.")
-    target, roots = _file_context(current_settings, cluster)
+    target, roots = _file_context(current_settings, cluster, project)
     cwd = resolve_remote_path(None, roots, base=validate_file_base(cwd_base), label="cwd").path
     result = _run_remote_result(
         current_settings, target, ["bash", "-lc", command], tool="run_remote_command", timeout=timeout, cwd=cwd
@@ -1729,35 +1893,130 @@ def _job_summary(
     return None
 
 
-def _file_context(settings: Settings, cluster: str | None) -> tuple[Cluster, dict[str, str]]:
+class StorageRoots(dict):
+    """Allowlisted remote roots for one cluster and project.
+
+    Besides the root paths themselves, it carries the cluster info they came
+    from and the storage keys that need a project that was not selected.
+    """
+
+    def __init__(self, roots: dict[str, str], info: dict[str, Any]) -> None:
+        super().__init__(roots)
+        self.info = info
+        self.project: str | None = info.get("project")
+        self.pending: tuple[str, ...] = tuple(info.get("storage_pending_project") or ())
+
+
+def _cluster_context(settings: Settings, cluster: str | None, project: str | None) -> tuple[Cluster, dict[str, Any]]:
+    """Resolve the cluster and the cluster info for the given or active project.
+
+    An explicit project that changes no path on this cluster is an error, so a
+    call never silently lands in another project's directories. The active
+    project is simply ignored on clusters whose storage is not project-aware.
+    """
     target = settings.get_cluster(cluster)
-    info = settings.cluster_info(target.name)
+    explicit = project is not None and project != ""
+    name = validate_project_name(project) if explicit else get_active_project()
+    info = settings.cluster_info(target.name, project=name)
+    if name is not None and not info["project_applies"]:
+        if explicit:
+            raise ValueError(
+                f"Project '{name}' does not change any path on cluster '{target.name}': its storage has no "
+                "{project} placeholder and the project has no storage override for it."
+            )
+        info = settings.cluster_info(target.name, project=None)
+    return target, info
+
+
+def _needs_project_error(settings: Settings, target: Cluster, keys: Any) -> ValueError:
+    keys = ", ".join(f"storage.{key}" for key in keys)
+    known = ", ".join(sorted(settings.projects)) or "none configured; any valid name works"
+    return ValueError(
+        f"No project selected: {keys} on cluster '{target.name}' depend on {{project}}. "
+        f"Pass project=... or call project_use first. Known projects: {known}."
+    )
+
+
+def _roots(settings: Settings, target: Cluster, info: dict[str, Any], *, require_project: bool) -> StorageRoots:
     storage = info.get("storage", {})
     if not isinstance(storage, dict):
         raise ValueError("Cluster storage configuration must be a mapping.")
-    return target, allowed_roots_from_storage(storage)
+    pending = info.get("storage_pending_project") or []
+    if require_project:
+        missing = [key for key in REQUIRED_ROOT_KEYS if key in pending]
+        if missing:
+            raise _needs_project_error(settings, target, missing)
+    return StorageRoots(allowed_roots_from_storage(storage, require_primary=require_project), info)
 
 
-def _repo_context(settings: Settings, cluster: str | None) -> tuple[Cluster, str]:
-    target, roots = _file_context(settings, cluster)
+def _file_context(
+    settings: Settings,
+    cluster: str | None,
+    project: str | None = None,
+    *,
+    require_project: bool = True,
+) -> tuple[Cluster, StorageRoots]:
+    target, info = _cluster_context(settings, cluster, project)
+    return target, _roots(settings, target, info, require_project=require_project)
+
+
+def _repo_context(settings: Settings, cluster: str | None, project: str | None = None) -> tuple[Cluster, str]:
+    target, roots = _file_context(settings, cluster, project)
     remote_repo = roots.get("remote_repo")
     if not remote_repo:
         raise ValueError("Cluster must define storage.remote_repo before remote Git tools can be used.")
     return target, remote_repo
 
 
-def _env_context(settings: Settings, cluster: str | None) -> tuple[Cluster, dict[str, Any], dict[str, Any]]:
-    target, roots = _file_context(settings, cluster)
-    info = settings.cluster_info(target.name)
-    python_config = info.get("python")
+def _env_context(
+    settings: Settings,
+    cluster: str | None,
+    project: str | None = None,
+    *,
+    require_project: bool = True,
+) -> tuple[Cluster, StorageRoots, dict[str, Any]]:
+    target, roots = _file_context(settings, cluster, project, require_project=require_project)
+    python_config = roots.info.get("python")
     return target, roots, python_config if isinstance(python_config, dict) else {}
 
 
 def _required_storage(storage: dict[str, Any], key: str, purpose: str) -> str:
     value = storage.get(key)
     if not isinstance(value, str) or not value:
+        if key in getattr(storage, "pending", ()):
+            raise ValueError(
+                f"storage.{key} depends on {{project}} and no project is selected. "
+                f"Pass project=... or call project_use before using {purpose}."
+            )
         raise ValueError(f"Cluster must define storage.{key} before {purpose} can be used.")
     return value
+
+
+def _tasks_root(roots: StorageRoots) -> str:
+    """Folder for background tasks: storage.tasks_root, or run_root/mcp-tasks when unset."""
+    if "tasks_root" in roots.pending:
+        raise ValueError(
+            "storage.tasks_root depends on {project} and no project is selected. "
+            "Pass project=... or call project_use first."
+        )
+    configured = roots.info.get("storage", {}).get("tasks_root")
+    if configured:
+        return normalize_remote_root(configured, "storage.tasks_root")
+    return remote_tasks.tasks_root(_required_storage(roots, "run_root", "background tasks"))
+
+
+def _task_dir(roots: StorageRoots, task_id: str) -> str:
+    return _tasks_root(roots) + "/" + remote_tasks.validate_task_id(task_id)
+
+
+def _default_venv_name(target: Cluster, python_config: dict[str, Any], project: str | None) -> str:
+    """python.venv_name, which may use {project}; falls back to 'default' without a project."""
+    template = str(python_config.get("venv_name") or "default")
+    variables = get_settings().template_variables(target.name, project)
+    try:
+        return expand_template(template, variables)
+    except NeedsProject:
+        return "default"
 
 
 def _job_env(
@@ -1765,15 +2024,25 @@ def _job_env(
     profile_env: Any,
     call_env: dict[str, str] | None,
 ) -> dict[str, str]:
-    """Environment for jobs: HF cache vars, then cluster slurm.job_env, profile env, and per-call env."""
+    """Environment for jobs, later layers win.
+
+    MCP_PROJECT / MCP_REPO_DIR / MCP_RUN_DIR, then HF cache vars, cluster
+    slurm.job_env, profile env, and per-call env.
+    """
     storage = info.get("storage") if isinstance(info.get("storage"), dict) else {}
     policies = info.get("policies") if isinstance(info.get("policies"), dict) else {}
     slurm_info = info.get("slurm") if isinstance(info.get("slurm"), dict) else {}
     for label, value in (("slurm.job_env", slurm_info.get("job_env")), ("profile env", profile_env), ("env", call_env)):
         if value is not None and not isinstance(value, dict):
             raise ValueError(f"{label} must be a mapping of variable names to values.")
+    # Keys that need a missing project are absent from storage, so they are skipped here.
+    mcp_env = {
+        "MCP_PROJECT": info.get("project"),
+        "MCP_REPO_DIR": storage.get("remote_repo"),
+        "MCP_RUN_DIR": storage.get("run_root"),
+    }
     hf_env = hf.job_env(storage.get("hf_home"), bool(policies.get("compute_node_internet", False)))
-    return merge_env(hf_env, slurm_info.get("job_env"), profile_env, call_env)
+    return merge_env(mcp_env, hf_env, slurm_info.get("job_env"), profile_env, call_env)
 
 
 def _remote_git_status(settings: Settings, target: Cluster, remote_repo: str, tool: str) -> dict[str, Any]:
@@ -1796,14 +2065,13 @@ def _remote_rev(settings: Settings, target: Cluster, remote_repo: str, ref: str)
 def _launch_task(
     settings: Settings,
     target: Cluster,
-    storage: dict[str, Any],
+    storage: StorageRoots,
     kind: str,
     body: str,
     description: str,
 ) -> dict[str, object]:
-    run_root = _required_storage(storage, "run_root", "background tasks")
     task_id = remote_tasks.new_task_id(kind)
-    directory = remote_tasks.task_dir(run_root, task_id)
+    directory = _task_dir(storage, task_id)
     script_path = f"{directory}/task.sh"
     script = remote_tasks.wrap_task_script(directory, body, description=description)
     _run_remote_output(

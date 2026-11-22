@@ -23,7 +23,7 @@ class ResolvedRemotePath:
     relative: str
 
 
-def allowed_roots_from_storage(storage: dict[str, Any]) -> dict[str, str]:
+def allowed_roots_from_storage(storage: dict[str, Any], *, require_primary: bool = True) -> dict[str, str]:
     roots: dict[str, str] = {}
     for key in _REMOTE_ROOT_KEYS:
         value = storage.get(key)
@@ -32,9 +32,14 @@ def allowed_roots_from_storage(storage: dict[str, Any]) -> dict[str, str]:
         if not isinstance(value, str) or not value:
             raise ValueError(f"storage.{key} must be a non-empty string when set.")
         roots[key] = _normalize_absolute_remote_path(value, f"storage.{key}")
-    if not any(key in roots for key in REQUIRED_ROOT_KEYS):
+    if require_primary and not any(key in roots for key in REQUIRED_ROOT_KEYS):
         raise ValueError("Cluster must define storage.remote_repo or storage.run_root.")
     return roots
+
+
+def normalize_remote_root(path: str, label: str) -> str:
+    """Validate a configured absolute remote directory and return it normalized."""
+    return _normalize_absolute_remote_path(path, label)
 
 
 def resolve_remote_path(
