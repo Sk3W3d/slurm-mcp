@@ -247,10 +247,22 @@ detached under `tasks_root/<task_id>/` (default `run_root/mcp-tasks`). That fold
 on a login node. It's a last resort for when no dedicated tool fits, and it's
 off unless `allow_remote_shell: true`. When it's on:
 
-- **You approve each command.** The server shows the command, cluster,
-  folder and the agent's reason through MCP elicitation (a dialog in Claude
-  Code). If you decline or cancel, or the client can't prompt, it doesn't
-  run.
+- **Read-only commands run without asking.** These are Slurm queries
+  (`squeue`, `sacct`, `sinfo`, `scontrol show`, `seff`, …),
+  `diskusage_report`, `module avail`/`spider`, `pip list`, read-only git
+  (`status`, `log`, `diff`, `show`, listing branches), and file inspection
+  (`ls`, `cat`, `head`, `tail`, `grep`, `find`, `du`, …). This applies only
+  when the whole command line is made of them, joined by `|`, `&&`, `||` or
+  `;`, with no output redirection (other than to `/dev/null` and `2>&1`),
+  `$(...)`, background `&` or `VAR=` prefixes. Arguments are checked too: for
+  example, `git branch -D`, `find -delete`, `sort -o` and
+  `scontrol update` still need approval. The list is `READ_ONLY_COMMANDS` in
+  `slurm_mcp/shell_guard.py`. `remote_shell_readonly_commands` adds names you
+  trust, and `remote_shell_auto_approve_readonly: false` turns this off.
+- **You approve every other command.** The server shows the command,
+  cluster, folder, the agent's reason and why approval is needed, through MCP
+  elicitation (a dialog in Claude Code). If you decline or cancel, or the
+  client can't prompt, it doesn't run.
 - **Clearly destructive commands are always refused**, even when approved.
   That covers recursive deletion of any configured folder or anything above
   it (home, project and scratch roots included), `scancel` (use

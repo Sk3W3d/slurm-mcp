@@ -119,6 +119,10 @@ class Settings:
     allow_remote_shell: bool = False
     # DANGEROUS when True: run_remote_command stops asking the user to approve each command.
     remote_shell_auto_approve: bool = False
+    # Read-only allowlisted commands (squeue, ls, git log, ...) run without asking.
+    remote_shell_auto_approve_readonly: bool = True
+    # Extra command names the user trusts as read-only (any arguments).
+    remote_shell_readonly_commands: tuple[str, ...] = ()
     max_transfer_bytes: int = 200_000_000
     # Local directories that upload/download/sync tools may touch. Empty means the
     # server's working directory at startup.
@@ -275,7 +279,8 @@ _TOP_LEVEL_KEYS = frozenset(
     {
         "default_cluster", "clusters", "ssh_command", "cluster_defaults", "profiles", "audit_log", "state_db",
         "ssh_backend", "ssh_config", "known_hosts", "duo_option", "keepalive_seconds", "allow_remote_shell",
-        "remote_shell_auto_approve", "max_transfer_bytes", "local_roots", "projects", "default_project",
+        "remote_shell_auto_approve", "remote_shell_auto_approve_readonly", "remote_shell_readonly_commands",
+        "max_transfer_bytes", "local_roots", "projects", "default_project",
     }
 )
 _SECTION_KEYS = frozenset({"docs", "policies", "setup_hints", "slurm", "storage", "python"})
@@ -375,11 +380,21 @@ def load_settings(path: str | Path) -> Settings:
         keepalive_seconds=_positive_int(raw, "keepalive_seconds", 60),
         allow_remote_shell=_bool(raw, "allow_remote_shell", False),
         remote_shell_auto_approve=_bool(raw, "remote_shell_auto_approve", False),
+        remote_shell_auto_approve_readonly=_bool(raw, "remote_shell_auto_approve_readonly", True),
+        remote_shell_readonly_commands=_command_names(raw, "remote_shell_readonly_commands"),
         max_transfer_bytes=_positive_int(raw, "max_transfer_bytes", 200_000_000),
         local_roots=_string_tuple(raw, "local_roots"),
         projects=_projects(raw.get("projects"), clusters),
         default_project=default_project,
     )
+
+
+def _command_names(mapping: dict[str, Any], key: str) -> tuple[str, ...]:
+    names = _string_tuple(mapping, key)
+    for name in names:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", name):
+            raise ValueError(f"'{key}' must list plain command names (no paths, spaces, or shell syntax): {name!r}")
+    return names
 
 
 def _projects(raw: Any, clusters: dict[str, Cluster]) -> dict[str, Project]:

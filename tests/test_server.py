@@ -335,12 +335,15 @@ class LocalToolTests(unittest.TestCase):
     def test_shell_runs_only_after_the_user_approves(self) -> None:
         self._enable_shell()
         approving = FakeClient(approve=True)
-        result = self._shell("echo hello from $PWD", ctx=approving)
+        # touch writes a file, so it is not on the read-only list and needs approval.
+        result = self._shell("touch approved-marker && echo hello from $PWD", ctx=approving)
         self.assertEqual(result["returncode"], 0)
         self.assertIn("hello from", result["stdout"])
         self.assertEqual(result["approval"], "approved by the user")
-        self.assertIn("echo hello from $PWD", approving.prompts[0])
+        self.assertTrue((self.remote / "repo" / "approved-marker").exists())
+        self.assertIn("touch approved-marker", approving.prompts[0])
         self.assertIn("no dedicated tool lists disk usage", approving.prompts[0])
+        self.assertIn("Asking because 'touch' is not on the read-only list", approving.prompts[0])
 
         for client, message in (
             (FakeClient(approve=False), "declined by the user"),
@@ -355,6 +358,30 @@ class LocalToolTests(unittest.TestCase):
         audit = (self.tmp / "audit.jsonl").read_text(encoding="utf-8")
         self.assertIn('"decision": "not_approved"', audit)
         self.assertIn('"decision": "run"', audit)
+
+    def test_read_only_commands_run_without_asking(self) -> None:
+        self._enable_shell()
+        (self.remote / "repo" / "a.txt").write_text("one\ntwo\n", encoding="utf-8", newline="\n")
+        never_asked = FakeClient(approve=False)  # would decline if it were asked
+        result = self._shell("ls && wc -l a.txt | cat 2>/dev/null", ctx=never_asked)
+        self.assertEqual(result["approval"], "auto (read-only allowlist)")
+        self.assertIn("a.txt", result["stdout"])
+        self.assertEqual(never_asked.prompts, [])
+        # Writing a file is not read-only, so the same client is asked and declines.
+        with self.assertRaisesRegex(ValueError, "declined"):
+            self._shell("wc -l a.txt > count.txt", ctx=never_asked)
+        self.assertIn("output redirection", never_asked.prompts[0])
+
+        # With read-only auto-approval off, everything is asked again.
+        server.settings = dataclasses.replace(server.get_settings(), remote_shell_auto_approve_readonly=False)
+        with self.assertRaisesRegex(ValueError, "declined"):
+            self._shell("ls", ctx=never_asked)
+
+        # Extra trusted names extend the list.
+        server.settings = dataclasses.replace(
+            server.get_settings(), remote_shell_auto_approve_readonly=True, remote_shell_readonly_commands=("uname",)
+        )
+        self.assertEqual(self._shell("uname -s", ctx=never_asked)["approval"], "auto (read-only allowlist)")
 
     def test_shell_guard_applies_even_with_auto_approve(self) -> None:
         self._enable_shell(auto_approve=True)

@@ -43,6 +43,13 @@ allow_remote_shell: false
 # account. The built-in denylist is a seatbelt, not a sandbox. Keep this false
 # unless you fully trust the session and are watching it.
 remote_shell_auto_approve: false
+# Read-only commands run without asking (squeue, sacct, scontrol show, diskusage_report,
+# module avail, pip list, git status/log/diff, ls, cat, grep, find, du, ...), but only
+# when the whole command is made of them, with no output redirection, $(...), or
+# background jobs. See READ_ONLY_COMMANDS in slurm_mcp/shell_guard.py.
+remote_shell_auto_approve_readonly: true
+# Extra command names you trust as read-only, with any arguments.
+remote_shell_readonly_commands: []
 
 cluster_defaults:
   docs:

@@ -2435,8 +2435,12 @@ async def run_remote_command(
     before calling it. reason must say why no dedicated tool works; it is saved
     in the audit log and the project record.
 
-    Each command is shown to the user for approval first (unless the config
-    sets remote_shell_auto_approve). It runs in the project's remote_repo (or
+    Read-only commands run without asking: Slurm queries (squeue, sacct,
+    sinfo, scontrol show, ...), diskusage_report, module avail/spider, pip
+    list, read-only git (status, log, diff, show, ...), and file inspection
+    (ls, cat, head, tail, grep, find, du, ...), joined by pipes or &&, with no
+    output redirection or $(...). Everything else is shown to the user for
+    approval first (unless the config sets remote_shell_auto_approve). It runs in the project's remote_repo (or
     cwd_base) with a timeout of at most 600 s. Login nodes are shared, so
     nothing heavy: no training, big preprocessing, or long compiles.
     Clearly destructive commands are refused even when approved:
@@ -2472,12 +2476,20 @@ async def run_remote_command(
         _write_remote_audit(current_settings, {**event, "decision": "refused_by_guard", "problems": problems})
         raise ValueError("Refused: " + " ".join(problems))
 
+    readonly, needs_approval_because = (
+        shell_guard.auto_approvable(command, current_settings.remote_shell_readonly_commands)
+        if current_settings.remote_shell_auto_approve_readonly
+        else (False, "read-only auto-approval is off")
+    )
     if current_settings.remote_shell_auto_approve:
         approval = "auto (remote_shell_auto_approve is on)"
+    elif readonly:
+        approval = "auto (read-only allowlist)"
     else:
         prompt = (
             f"An agent wants to run this on {target.name} ({target.user or 'you'}@{target.host}):\n\n"
-            f"    {command}\n\nin {cwd}\n\nReason given: {safe_reason}\n\nApprove?"
+            f"    {command}\n\nin {cwd}\n\nReason given: {safe_reason}\n"
+            f"Asking because {needs_approval_because}.\n\nApprove?"
         )
         approved, approval = await _approve_shell(ctx, prompt)
         if not approved:
