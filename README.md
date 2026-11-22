@@ -224,6 +224,28 @@ below also take `project=`.
 configured storage roots. Local paths must stay inside `local_roots`.
 Transfers are capped at `max_transfer_bytes`.
 
+**Directories and cluster-to-cluster copies:**
+
+- **`upload_directory`, `download_directory`.** These copy a whole folder,
+  packed as an uncompressed tar archive and unpacked on the other side.
+  `exclude` takes tar-style patterns such as `[".git", "__pycache__",
+  "*.ckpt"]`. An existing destination is refused unless `overwrite=True`,
+  which merges into it. Local unpacking refuses entries that would land
+  outside the destination: `..` paths, and links pointing elsewhere.
+- **`copy_between_clusters`.** This copies a file or folder from one cluster
+  to another. Each side has its own base and project. Both clusters must be
+  logged in. Login nodes can't log in to each other without 2FA, so the data
+  is relayed through this machine: packed on the source, pulled to a
+  temporary folder, pushed and unpacked on the destination. Within one
+  cluster it's a direct copy on the cluster.
+- **Size and speed.** Everything is capped at `max_transfer_bytes` and goes
+  through your own connection. For large datasets, use
+  [Globus](https://docs.alliancecan.ca/wiki/Globus), which moves data between
+  clusters directly.
+- **Cleanup and records.** Temporary archives are removed even when a step
+  fails. Each transfer is recorded in the project history as
+  `files_uploaded`, `files_downloaded` or `files_copied`.
+
 **Git:** `remote_git_status`, `remote_git_rev`, `remote_git_branch`,
 `remote_git_fetch`, `remote_git_pull` (fast-forward only, dry run by default),
 `remote_git_checkout`, `remote_git_clone`, `sync_local_commits`. Tools that

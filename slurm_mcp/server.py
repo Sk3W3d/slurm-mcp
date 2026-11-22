@@ -19,6 +19,7 @@ from . import huggingface as hf
 from . import python_env
 from . import remote_tasks
 from . import shell_guard
+from . import transfers
 from .audit import preview_text, write_audit_event
 from .config import Cluster, NeedsProject, Settings, expand_template, load_settings, validate_project_name
 from .ledger import Ledger
@@ -472,8 +473,8 @@ def project_history(
 
     Events are recorded automatically: job_submitted, job_finished,
     job_cancel_requested, repo_cloned, repo_pulled, repo_checkout,
-    repo_synced, task_started, task_finished. Notes added with project_note
-    have kind "note". Filter with kind or cluster. Defaults to the active project.
+    repo_synced, task_started, task_finished, shell_command, files_uploaded,
+    files_downloaded, files_copied. Notes added with project_note have kind "note". Filter with kind or cluster. Defaults to the active project.
     """
     current_settings = get_settings()
     ledger = _require_ledger()
@@ -1462,6 +1463,351 @@ def download_file(
         "path": resolved.path,
         "local_path": str(destination),
         "bytes": destination.stat().st_size,
+    }
+
+
+def _human_bytes(count: int | None) -> str:
+    if count is None:
+        return "unknown size"
+    size = float(count)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{count} B"
+
+
+def _remote_kind(settings: Settings, target: Cluster, path: str, tool: str) -> str | None:
+    """'dir', 'file', another stat type (e.g. 'symbolic link'), or None if the path does not exist."""
+    result = _run_remote_result(settings, target, transfers.remote_kind_argv(path), tool=tool, timeout=15)
+    if result.returncode != 0:
+        return None
+    kind = result.stdout.strip()
+    if kind == "directory":
+        return "dir"
+    if kind in {"regular file", "regular empty file"}:
+        return "file"
+    return kind or None
+
+
+def _remote_size(settings: Settings, target: Cluster, path: str, excludes: list[str], tool: str) -> int | None:
+    result = _run_remote_result(settings, target, transfers.remote_size_argv(path, excludes), tool=tool, timeout=120)
+    return transfers.parse_size(result.stdout) if result.returncode == 0 else None
+
+
+def _local_destination(
+    settings: Settings, target: Cluster, roots: StorageRoots, resolved: Any, local_path: str | None, label: str
+) -> Path:
+    local_roots = settings.local_root_paths()
+    if local_path:
+        return resolve_local_path(local_path, local_roots, label=label)
+    parts = ["slurm-mcp-downloads", target.name, *([roots.project] if roots.project else [])]
+    return resolve_local_path("/".join([*parts, resolved.root_name, resolved.relative or "root"]), local_roots, label=label)
+
+
+def _push_archive(
+    settings: Settings, target: Cluster, archive: Path, destination: str, tool: str, details: dict[str, Any]
+) -> None:
+    """Upload a local tar next to destination, unpack it there, and remove it (also on failure)."""
+    parent = remote_parent(destination)
+    remote_archive = f"{parent}/{transfers.transfer_name()}"
+    _run_remote_output(settings, target, ["mkdir", "-p", "--", parent], tool=tool, timeout=30)
+    try:
+        _transfer(
+            settings,
+            target,
+            tool,
+            {**details, "local_path": str(archive), "remote_path": remote_archive, "bytes": archive.stat().st_size},
+            lambda: get_backend().upload(target.host, archive, remote_archive),
+        )
+    except Exception:
+        _run_remote_result(settings, target, ["rm", "-f", "--", remote_archive], tool=tool, timeout=30)
+        raise
+    # The extract script deletes the archive whether or not unpacking succeeds.
+    _run_remote_output(
+        settings, target, transfers.remote_tar_extract_argv(remote_archive, destination), tool=tool, timeout=600
+    )
+
+
+def _pull_archive(
+    settings: Settings,
+    target: Cluster,
+    roots: StorageRoots,
+    source_dir: str,
+    excludes: list[str],
+    local_archive: Path,
+    tool: str,
+) -> int | None:
+    """Pack a remote directory into the tasks folder, download it, and remove the remote copy."""
+    remote_archive = f"{_tasks_root(roots)}/{transfers.transfer_name()}"
+    try:
+        output = _run_remote_output(
+            settings, target, transfers.remote_tar_create_argv(source_dir, remote_archive, excludes), tool=tool, timeout=600
+        )
+        size = transfers.parse_size(output.splitlines()[-1] if output else "")
+        if size is not None:
+            check_transfer_size(size, settings.max_transfer_bytes, "Directory archive")
+        _transfer(
+            settings,
+            target,
+            tool,
+            {"remote_path": remote_archive, "local_path": str(local_archive), "bytes": size},
+            lambda: get_backend().download(target.host, remote_archive, local_archive),
+        )
+        return size
+    finally:
+        _run_remote_result(settings, target, ["rm", "-f", "--", remote_archive], tool=tool, timeout=30)
+
+
+@mcp.tool()
+def upload_directory(
+    local_dir: str,
+    remote_dir: str,
+    cluster: str | None = None,
+    base: str = "remote_repo",
+    overwrite: bool = False,
+    exclude: list[str] | None = None,
+    project: str | None = None,
+) -> dict[str, object]:
+    """Copy a local directory (inside local_roots) to the cluster.
+
+    The directory's contents land in remote_dir (relative to base, or an
+    absolute path inside an allowed root), which is created. If remote_dir
+    exists, the call refuses unless overwrite=True, which merges into it and
+    replaces same-named files. exclude takes tar-style patterns, e.g.
+    [".git", "__pycache__", "*.ckpt"]; a pattern without '/' matches any path
+    component. The archive is capped by max_transfer_bytes. For code, prefer
+    sync_local_commits, which sends git history and no stray files.
+    """
+    current_settings = get_settings()
+    target, roots = _file_context(current_settings, cluster, project)
+    excludes = transfers.validate_excludes(exclude)
+    source = resolve_local_path(local_dir, current_settings.local_root_paths(), label="local_dir")
+    if not source.is_dir():
+        raise ValueError(f"Local directory not found: {source}")
+    resolved = resolve_remote_path(remote_dir, roots, base=validate_file_base(base), label="remote_dir")
+    if not resolved.relative:
+        raise ValueError("remote_dir must be a folder inside the root, not the root itself.")
+    existing = _remote_kind(current_settings, target, resolved.path, "upload_directory")
+    if existing is not None:
+        if existing != "dir":
+            raise ValueError(f"{resolved.path} exists and is not a directory.")
+        if not overwrite:
+            raise ValueError(f"{resolved.path} already exists. Pass overwrite=True to merge into it.")
+
+    with tempfile.TemporaryDirectory(prefix="slurm-mcp-") as tmp:
+        archive = Path(tmp) / "upload.tar"
+        entries, content_bytes = transfers.make_local_tar(source, archive, excludes)
+        check_transfer_size(archive.stat().st_size, current_settings.max_transfer_bytes, "Directory archive")
+        _push_archive(current_settings, target, archive, resolved.path, "upload_directory", {"source": str(source)})
+
+    summary = f"Uploaded {source} to {resolved.path} ({entries} entries, {_human_bytes(content_bytes)})"
+    recorded = _record(
+        lambda ledger: ledger.add_event(
+            "files_uploaded",
+            summary,
+            project=roots.project,
+            cluster=target.name,
+            data={"local": str(source), "remote": resolved.path, "entries": entries, "bytes": content_bytes,
+                  "exclude": excludes},
+        )
+    )
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "local_dir": str(source),
+        "path": resolved.path,
+        "root": resolved.root_name,
+        "relative_path": resolved.relative,
+        "entries": entries,
+        "bytes": content_bytes,
+        "merged_into_existing": existing is not None,
+        **recorded,
+    }
+
+
+@mcp.tool()
+def download_directory(
+    remote_dir: str,
+    local_dir: str | None = None,
+    cluster: str | None = None,
+    base: str = "run_root",
+    overwrite: bool = False,
+    exclude: list[str] | None = None,
+    project: str | None = None,
+) -> dict[str, object]:
+    """Copy a directory from an allowlisted root on the cluster to the local machine.
+
+    Without local_dir, it lands in
+    <first local root>/slurm-mcp-downloads/<cluster>/[<project>/]<root>/<relative path>.
+    If the local folder exists, the call refuses unless overwrite=True, which
+    merges into it. Entries that would land outside the folder (absolute
+    paths, '..', links pointing out) are refused. exclude takes tar-style
+    patterns, e.g. ["*.ckpt", "wandb"]. The size is checked against
+    max_transfer_bytes before anything is packed.
+    """
+    current_settings = get_settings()
+    target, roots = _file_context(current_settings, cluster, project)
+    excludes = transfers.validate_excludes(exclude)
+    resolved = resolve_remote_path(remote_dir, roots, base=validate_file_base(base), label="remote_dir")
+    if _remote_kind(current_settings, target, resolved.path, "download_directory") != "dir":
+        raise ValueError(f"Remote path is not a directory: {resolved.path}")
+    size = _remote_size(current_settings, target, resolved.path, excludes, "download_directory")
+    if size is not None:
+        check_transfer_size(size, current_settings.max_transfer_bytes, "Remote directory")
+    destination = _local_destination(current_settings, target, roots, resolved, local_dir, "local_dir")
+    if destination.exists():
+        if not destination.is_dir():
+            raise ValueError(f"Local path exists and is not a directory: {destination}")
+        if not overwrite:
+            raise ValueError(f"Local directory already exists: {destination}. Pass overwrite=True to merge into it.")
+
+    with tempfile.TemporaryDirectory(prefix="slurm-mcp-") as tmp:
+        archive = Path(tmp) / "download.tar"
+        _pull_archive(current_settings, target, roots, resolved.path, excludes, archive, "download_directory")
+        entries = transfers.safe_extract(archive, destination)
+
+    summary = f"Downloaded {resolved.path} to {destination} ({entries} entries, {_human_bytes(size)})"
+    recorded = _record(
+        lambda ledger: ledger.add_event(
+            "files_downloaded",
+            summary,
+            project=roots.project,
+            cluster=target.name,
+            data={"remote": resolved.path, "local": str(destination), "entries": entries, "bytes": size,
+                  "exclude": excludes},
+        )
+    )
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "path": resolved.path,
+        "local_dir": str(destination),
+        "entries": entries,
+        "bytes": size,
+        **recorded,
+    }
+
+
+@mcp.tool()
+def copy_between_clusters(
+    source_path: str,
+    dest_path: str,
+    source_cluster: str,
+    dest_cluster: str,
+    source_base: str = "run_root",
+    dest_base: str = "run_root",
+    source_project: str | None = None,
+    dest_project: str | None = None,
+    overwrite: bool = False,
+    exclude: list[str] | None = None,
+) -> dict[str, object]:
+    """Copy a file or directory from one cluster to another, or to another place on the same cluster.
+
+    Both clusters must be logged in (cluster_login). Between two clusters the
+    data is relayed through this machine: packed on the source, pulled to a
+    temporary folder here, pushed to the destination, and unpacked. Cluster
+    login nodes cannot log in to each other without 2FA, so a direct copy is
+    not possible. It is capped by max_transfer_bytes and limited by this
+    machine's network; for very large datasets use Globus
+    (https://docs.alliancecan.ca/wiki/Globus). Within one cluster it is a
+    direct copy on the cluster.
+
+    Paths are relative to source_base / dest_base (or absolute inside an
+    allowed root), and each side can use its own project. A directory's
+    contents land in dest_path. Refuses to replace an existing destination
+    unless overwrite=True (directories are merged). exclude applies to
+    directories.
+    """
+    current_settings = get_settings()
+    excludes = transfers.validate_excludes(exclude)
+    src_target, src_roots = _file_context(current_settings, source_cluster, source_project)
+    dst_target, dst_roots = _file_context(current_settings, dest_cluster, dest_project)
+    src = resolve_remote_path(source_path, src_roots, base=validate_file_base(source_base), label="source_path")
+    dst = resolve_remote_path(dest_path, dst_roots, base=validate_file_base(dest_base), label="dest_path")
+    if not dst.relative:
+        raise ValueError("dest_path must be inside the root, not the root itself.")
+    tool = "copy_between_clusters"
+
+    kind = _remote_kind(current_settings, src_target, src.path, tool)
+    if kind not in {"file", "dir"}:
+        raise ValueError(f"{src_target.name}:{src.path} is not a file or directory" + (f" ({kind})" if kind else ""))
+    existing = _remote_kind(current_settings, dst_target, dst.path, tool)
+    if existing is not None:
+        if not overwrite:
+            raise ValueError(f"{dst_target.name}:{dst.path} already exists. Pass overwrite=True to replace or merge.")
+        if existing != kind:
+            raise ValueError(f"{dst_target.name}:{dst.path} exists but is a {existing}, and the source is a {kind}.")
+    size = _remote_size(current_settings, src_target, src.path, excludes if kind == "dir" else [], tool)
+
+    if src_target.name == dst_target.name:
+        if dst.path == src.path or dst.path.startswith(src.path.rstrip("/") + "/"):
+            raise ValueError("Cannot copy a path into itself.")
+        _run_remote_output(
+            current_settings,
+            dst_target,
+            transfers.remote_copy_argv(src.path, dst.path, is_dir=kind == "dir", excludes=excludes),
+            tool=tool,
+            timeout=600,
+        )
+        method = "direct copy on the cluster"
+    else:
+        if size is not None:
+            check_transfer_size(size, current_settings.max_transfer_bytes, "Source")
+        with tempfile.TemporaryDirectory(prefix="slurm-mcp-") as tmp:
+            if kind == "file":
+                local_file = Path(tmp) / "file"
+                _transfer(
+                    current_settings, src_target, tool,
+                    {"remote_path": src.path, "local_path": str(local_file), "bytes": size},
+                    lambda: get_backend().download(src_target.host, src.path, local_file),
+                )
+                parent = remote_parent(dst.path)
+                partial = f"{parent}/{transfers.transfer_name('.part')}"
+                _run_remote_output(current_settings, dst_target, ["mkdir", "-p", "--", parent], tool=tool, timeout=30)
+                try:
+                    _transfer(
+                        current_settings, dst_target, tool,
+                        {"local_path": str(local_file), "remote_path": partial, "bytes": size},
+                        lambda: get_backend().upload(dst_target.host, local_file, partial),
+                    )
+                    # Rename into place so the destination is never half-written.
+                    _run_remote_output(
+                        current_settings, dst_target, ["mv", "-f", "--", partial, dst.path], tool=tool, timeout=30
+                    )
+                except Exception:
+                    _run_remote_result(current_settings, dst_target, ["rm", "-f", "--", partial], tool=tool, timeout=30)
+                    raise
+            else:
+                archive = Path(tmp) / "relay.tar"
+                _pull_archive(current_settings, src_target, src_roots, src.path, excludes, archive, tool)
+                _push_archive(
+                    current_settings, dst_target, archive, dst.path, tool, {"source": f"{src_target.name}:{src.path}"}
+                )
+        method = "relayed through this machine"
+
+    summary = (
+        f"Copied {src_target.name}:{src.path} to {dst_target.name}:{dst.path} "
+        f"({kind}, {_human_bytes(size)}, {method})"
+    )
+    data = {"source_cluster": src_target.name, "source": src.path, "dest_cluster": dst_target.name, "dest": dst.path,
+            "kind": kind, "bytes": size, "method": method, "exclude": excludes}
+
+    def write(ledger: Ledger) -> None:
+        ledger.add_event("files_copied", summary, project=dst_roots.project, cluster=dst_target.name, data=data)
+        if src_roots.project and src_roots.project != dst_roots.project:
+            ledger.add_event("files_copied", summary, project=src_roots.project, cluster=src_target.name, data=data)
+
+    return {
+        "source_cluster": src_target.name,
+        "source_path": src.path,
+        "dest_cluster": dst_target.name,
+        "dest_path": dst.path,
+        "kind": kind,
+        "bytes": size,
+        "method": method,
+        "replaced_existing": existing is not None,
+        **_record(write),
     }
 
 

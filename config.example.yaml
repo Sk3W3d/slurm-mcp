@@ -30,7 +30,8 @@ state_db: .slurm-mcp-state.sqlite3
 # local_roots:
 #   - D:/Projects/my-paper
 
-# Cap for upload_file, download_file, and git bundles.
+# Cap per transfer: files, directory archives, cluster-to-cluster relays, and git bundles.
+# Relays go through this machine; for big datasets use Globus instead of raising this a lot.
 max_transfer_bytes: 200000000
 
 # Enables run_remote_command: any bash command on a login node, as a last resort

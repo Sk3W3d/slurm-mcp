@@ -593,6 +593,90 @@ class ProjectToolTests(unittest.TestCase):
             self.assertTrue(after[name]["ok"], name)
         self.assertTrue(after["git_repo_status"]["status"]["clean"])
 
+    def test_directory_upload_and_download(self) -> None:
+        server.project_use("alpha")
+        data = self.local / "data"
+        (data / "nested" / "__pycache__").mkdir(parents=True)
+        (data / "a.txt").write_text("alpha\n", encoding="utf-8", newline="\n")
+        (data / "nested" / "b.txt").write_text("beta\n", encoding="utf-8", newline="\n")
+        (data / "nested" / "__pycache__" / "c.pyc").write_bytes(b"x")
+
+        up = server.upload_directory("data", "inputs/data", base="run_root", exclude=["__pycache__"])
+        remote = self.remote / "runs" / "alpha" / "inputs" / "data"
+        self.assertEqual(up["entries"], 3)
+        self.assertEqual((remote / "nested" / "b.txt").read_text(encoding="utf-8"), "beta\n")
+        self.assertFalse((remote / "nested" / "__pycache__").exists())
+        self.assertEqual([p.name for p in remote.parent.iterdir()], ["data"])  # no leftover archive
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            server.upload_directory("data", "inputs/data", base="run_root")
+        (data / "new.txt").write_text("new\n", encoding="utf-8")
+        self.assertTrue(server.upload_directory("data", "inputs/data", base="run_root", overwrite=True)["merged_into_existing"])
+        self.assertTrue((remote / "new.txt").exists())
+
+        down = server.download_directory("inputs/data", exclude=["*.pyc"])
+        local = Path(down["local_dir"])
+        self.assertEqual(local, self.local / "slurm-mcp-downloads" / "local" / "alpha" / "run_root" / "inputs" / "data")
+        self.assertEqual((local / "a.txt").read_text(encoding="utf-8"), "alpha\n")
+        self.assertEqual(sorted(p.name for p in (self.remote / "tasks").iterdir()), [])  # remote archive removed
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            server.download_directory("inputs/data")
+        with self.assertRaisesRegex(ValueError, "not a directory"):
+            server.download_directory("inputs/data/a.txt")
+        kinds = [event["kind"] for event in server.project_history()["events"]]
+        self.assertIn("files_uploaded", kinds)
+        self.assertIn("files_downloaded", kinds)
+
+    def test_copy_between_clusters_relays_files_and_directories(self) -> None:
+        results = self.remote / "runs" / "alpha" / "results"
+        (results / "plots").mkdir(parents=True)
+        (results / "metrics.json").write_text('{"acc": 0.71}\n', encoding="utf-8", newline="\n")
+        (results / "plots" / "loss.txt").write_text("1.0\n0.5\n", encoding="utf-8", newline="\n")
+        (results / "model.ckpt").write_bytes(b"0" * 100)
+        (self.remote / "fixed-runs").mkdir()
+
+        copied = server.copy_between_clusters(
+            "results", "from-alpha", source_cluster="local", dest_cluster="fixed",
+            source_project="alpha", exclude=["*.ckpt"],
+        )
+        self.assertEqual((copied["kind"], copied["method"]), ("dir", "relayed through this machine"))
+        dest = self.remote / "fixed-runs" / "from-alpha"
+        self.assertEqual((dest / "plots" / "loss.txt").read_text(encoding="utf-8"), "1.0\n0.5\n")
+        self.assertFalse((dest / "model.ckpt").exists())
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            server.copy_between_clusters("results", "from-alpha", "local", "fixed", source_project="alpha")
+
+        one = server.copy_between_clusters(
+            "results/metrics.json", "metrics-copy.json", "local", "fixed", source_project="alpha"
+        )
+        self.assertEqual(one["kind"], "file")
+        self.assertEqual((self.remote / "fixed-runs" / "metrics-copy.json").read_text(encoding="utf-8"), '{"acc": 0.71}\n')
+        self.assertFalse([p for p in (self.remote / "fixed-runs").iterdir() if p.name.startswith(".slurm-mcp")])
+
+        same = server.copy_between_clusters(
+            "results", "results-backup", "local", "local", source_project="alpha", dest_project="alpha"
+        )
+        self.assertEqual(same["method"], "direct copy on the cluster")
+        self.assertTrue((self.remote / "runs" / "alpha" / "results-backup" / "plots" / "loss.txt").exists())
+        with self.assertRaisesRegex(ValueError, "into itself"):
+            server.copy_between_clusters(
+                "results", "results/inner", "local", "local", source_project="alpha", dest_project="alpha"
+            )
+        with self.assertRaisesRegex(ValueError, "not a file or directory"):
+            server.copy_between_clusters("missing", "x", "local", "fixed", source_project="alpha")
+
+    def test_transfers_respect_the_size_cap(self) -> None:
+        server.project_use("alpha")
+        server.settings = dataclasses.replace(server.get_settings(), max_transfer_bytes=50)
+        big = self.local / "big"
+        big.mkdir()
+        (big / "blob.bin").write_bytes(b"0" * 5000)
+        with self.assertRaisesRegex(ValueError, "max_transfer_bytes"):
+            server.upload_directory("big", "inputs/big", base="run_root")
+        (self.remote / "runs" / "alpha" / "big").mkdir(parents=True)
+        (self.remote / "runs" / "alpha" / "big" / "blob.bin").write_bytes(b"0" * 5000)
+        with self.assertRaisesRegex(ValueError, "max_transfer_bytes"):
+            server.download_directory("big")
+
     def test_server_instructions_are_published(self) -> None:
         self.assertIn("project_status", server.mcp.instructions)
         self.assertIn("project_note", server.mcp.instructions)
