@@ -262,6 +262,16 @@ class SlurmExtrasTests(unittest.TestCase):
         self.assertIn("--export=ALL,HF_HOME=/p/hf", argv)
         self.assertEqual(argv[-1], "run.sh")
 
+    def test_cpu_account_used_only_for_jobs_without_gpus(self) -> None:
+        accounts = {"default_account": "rrg-pi", "cpu_account": "def-pi"}
+        self.assertEqual(merge_job_options({"cpus_per_task": 2}, None, **accounts)["account"], "def-pi")
+        self.assertEqual(merge_job_options({"gpus": 1}, None, **accounts)["account"], "rrg-pi")
+        self.assertEqual(merge_job_options({"gres": "gpu:a100:1"}, None, **accounts)["account"], "rrg-pi")
+        # Turning GPUs off per call switches to the CPU account; an explicit account always wins.
+        self.assertEqual(merge_job_options({"gpus": 1}, {"gpus": 0}, **accounts)["account"], "def-pi")
+        self.assertEqual(merge_job_options({}, {"account": "def-other"}, **accounts)["account"], "def-other")
+        self.assertEqual(merge_job_options({}, None, default_account="rrg-pi")["account"], "rrg-pi")
+
     def test_profile_env_key_is_allowed(self) -> None:
         argv = build_sbatch_argv({"time": "00:10:00", "env": {"A": "1"}}, "run.sh")
         self.assertNotIn("--env", " ".join(argv))

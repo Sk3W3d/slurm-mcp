@@ -264,18 +264,36 @@ def parse_sinfo(output: str) -> list[dict[str, str]]:
     return _parse_delimited_rows(output, SINFO_FIELDS)
 
 
+def requests_gpus(options: dict[str, Any]) -> bool:
+    """Whether merged job options ask for GPUs (through gpus or a gpu gres)."""
+    gpus = options.get("gpus")
+    if gpus not in (None, "", 0, "0"):
+        return True
+    gres = options.get("gres")
+    return isinstance(gres, str) and "gpu" in gres
+
+
 def merge_job_options(
     profile: dict[str, Any] | None,
     overrides: dict[str, Any] | None,
     default_account: str | None = None,
+    cpu_account: str | None = None,
 ) -> dict[str, Any]:
+    """Apply overrides to a profile and fill in --account when neither sets one.
+
+    cpu_account, when given, is used for jobs that request no GPUs (some
+    allocations, such as a GPU-only RAC, cannot run CPU jobs); otherwise
+    default_account is used.
+    """
     merged: dict[str, Any] = dict(profile or {})
     for key, value in (overrides or {}).items():
         if not isinstance(key, str) or not key:
             raise ValueError("Override keys must be non-empty strings.")
         merged[key] = value
-    if default_account and not merged.get("account"):
-        merged["account"] = default_account
+    if not merged.get("account"):
+        account = cpu_account if cpu_account and not requests_gpus(merged) else default_account
+        if account:
+            merged["account"] = account
     return merged
 
 

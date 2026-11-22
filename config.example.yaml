@@ -74,6 +74,9 @@ cluster_defaults:
     gpu_request_style: gres
     # Added as --account when a profile does not set one. See the slurm_accounts tool.
     # default_account: def-yourpi
+    # Account for jobs that request no GPUs, if it differs (e.g. when default_account
+    # is a GPU-only RAC allocation such as rrg-yourpi on one cluster).
+    # cpu_account: def-yourpi
     # Extra environment variables for every job (passed with --export=ALL,...).
     # job_env:
     #   OMP_NUM_THREADS: "1"

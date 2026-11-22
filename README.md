@@ -66,6 +66,8 @@ For each cluster, `config.yaml` sets the following under `storage`:
 Values in `cluster_defaults` apply to every cluster, and each cluster can
 override them key by key. `python.module` picks the Lmod Python module (for
 example `python/3.11`). `slurm.default_account` fills in `--account`.
+`slurm.cpu_account` replaces it for jobs that request no GPUs, for example
+when `default_account` is a GPU-only RAC allocation.
 `policies.compute_node_internet: false` makes jobs run with the Hugging Face
 offline flags.
 

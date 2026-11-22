@@ -498,6 +498,24 @@ class ProjectToolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not valid JSON"):
             server.project_record_sync(project="alpha")
 
+    def test_preflight_for_a_new_project(self) -> None:
+        def checks(**kwargs: Any) -> dict[str, dict[str, Any]]:
+            return {check["name"]: check for check in server.cluster_preflight(project="alpha", **kwargs)["checks"]}
+
+        before = checks()
+        self.assertFalse(before["storage_exists:remote_repo"]["ok"])
+        self.assertTrue(before["storage_exists:remote_repo"]["required"])
+        self.assertIn("sync_local_commits", before["storage_exists:remote_repo"]["hint"])
+        self.assertFalse(before["storage_exists:run_root"]["required"])
+
+        server.project_use("alpha")
+        self._sync_project_repo()
+        after = checks(write_check=True)
+        # The write check creates run_root/logs before run_root's existence is checked.
+        for name in ("storage_exists:remote_repo", "storage_exists:run_root", "logs_dir_create", "logs_dir_writable"):
+            self.assertTrue(after[name]["ok"], name)
+        self.assertTrue(after["git_repo_status"]["status"]["clean"])
+
     def test_server_instructions_are_published(self) -> None:
         self.assertIn("project_status", server.mcp.instructions)
         self.assertIn("project_note", server.mcp.instructions)

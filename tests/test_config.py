@@ -206,6 +206,24 @@ class ProjectTemplateTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     settings.storage_for("c", "p")
 
+    def test_unknown_or_misplaced_settings_are_errors(self) -> None:
+        cases = {
+            "under clusters.c.storage": "clusters:\n  c:\n    host: c\n    workspace_root: /x\n",
+            "Did you mean 'default_account'": "clusters:\n  c:\n    host: c\n    slurm:\n      defualt_account: def-x\n",
+            "Did you mean 'local_roots'": "local_root: [D:/x]\nclusters:\n  c:\n    host: c\n",
+            "cluster_defaults: unknown setting 'storge'": "cluster_defaults:\n  storge: {}\nclusters:\n  c:\n    host: c\n",
+            "cluster_defaults.python": "cluster_defaults:\n  python:\n    venv: x\nclusters:\n  c:\n    host: c\n",
+        }
+        for message, text in cases.items():
+            with self.subTest(message), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(ValueError, message):
+                    load_settings(_write_config(Path(tmp), text))
+
+    def test_shipped_example_config_loads(self) -> None:
+        example = Path(__file__).resolve().parents[1] / "config.example.yaml"
+        settings = load_settings(example)
+        self.assertIn("narval", settings.clusters)
+
     def test_reserved_storage_keys_and_unknown_project_cluster_rejected(self) -> None:
         bad_configs = [
             "clusters:\n  c:\n    host: c\n    storage:\n      project: /x\n",

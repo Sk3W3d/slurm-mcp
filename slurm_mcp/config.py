@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import difflib
 import re
 import sys
 from dataclasses import dataclass, field
@@ -268,22 +269,68 @@ class Settings:
         }
 
 
+_TOP_LEVEL_KEYS = frozenset(
+    {
+        "default_cluster", "clusters", "ssh_command", "cluster_defaults", "profiles", "audit_log", "state_db",
+        "ssh_backend", "ssh_config", "known_hosts", "duo_option", "keepalive_seconds", "allow_remote_shell",
+        "max_transfer_bytes", "local_roots", "projects", "default_project",
+    }
+)
+_SECTION_KEYS = frozenset({"docs", "policies", "setup_hints", "slurm", "storage", "python"})
+_CLUSTER_KEYS = _SECTION_KEYS | {"host", "user", "remote_repo", "run_root"}
+_SLURM_KEYS = frozenset(
+    {
+        "submit_command", "status_command", "accounting_command", "gpu_request_style", "default_account",
+        "cpu_account", "job_env",
+    }
+)
+_PYTHON_KEYS = frozenset({"module", "modules", "venv_name"})
+# Storage keys people tend to put one level too high.
+_STORAGE_HINT_KEYS = frozenset({"workspace_root", "venv_root", "hf_home", "tasks_root", "record_root"})
+
+
+def _check_keys(mapping: dict[str, Any], allowed: frozenset[str], label: str) -> None:
+    """Reject unknown keys, so a misplaced or misspelled setting is an error instead of silently ignored."""
+    for key in mapping:
+        if key in allowed:
+            continue
+        if key in _STORAGE_HINT_KEYS and "storage" in allowed:
+            raise ValueError(f"{label}: '{key}' is a storage setting; put it under {label}.storage instead.")
+        close = difflib.get_close_matches(str(key), sorted(allowed), n=1)
+        suggestion = f" Did you mean '{close[0]}'?" if close else ""
+        raise ValueError(f"{label}: unknown setting '{key}'.{suggestion}")
+
+
+def _check_sections(mapping: dict[str, Any], label: str) -> None:
+    for section, allowed in (("slurm", _SLURM_KEYS), ("python", _PYTHON_KEYS)):
+        value = mapping.get(section)
+        if isinstance(value, dict):
+            _check_keys(value, allowed, f"{label}.{section}")
+
+
 def load_settings(path: str | Path) -> Settings:
     config_path = Path(path)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("Config file must contain a YAML mapping.")
+    _check_keys(raw, _TOP_LEVEL_KEYS, "config")
 
     clusters_raw = raw.get("clusters")
     if not isinstance(clusters_raw, dict) or not clusters_raw:
         raise ValueError("Config must define at least one cluster under 'clusters'.")
 
-    defaults = _cluster_defaults(raw.get("cluster_defaults") or {})
+    defaults_raw = raw.get("cluster_defaults") or {}
+    if isinstance(defaults_raw, dict):
+        _check_keys(defaults_raw, _SECTION_KEYS, "cluster_defaults")
+        _check_sections(defaults_raw, "cluster_defaults")
+    defaults = _cluster_defaults(defaults_raw)
 
     clusters: dict[str, Cluster] = {}
     for name, value in clusters_raw.items():
         if not isinstance(value, dict):
             raise ValueError(f"Cluster '{name}' must be a mapping.")
+        _check_keys(value, _CLUSTER_KEYS, f"clusters.{name}")
+        _check_sections(value, f"clusters.{name}")
         host = value.get("host")
         if not isinstance(host, str) or not host:
             raise ValueError(f"Cluster '{name}' must define a non-empty host.")

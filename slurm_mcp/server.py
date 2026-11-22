@@ -859,10 +859,12 @@ def submit_job(
     if overrides is not None and not isinstance(overrides, dict):
         raise ValueError("overrides must be a mapping of profile keys to values.")
     default_account = slurm_info.get("default_account")
+    cpu_account = slurm_info.get("cpu_account")
     profile_data = merge_job_options(
         current_settings.get_profile(profile),
         overrides,
         default_account=str(default_account) if default_account else None,
+        cpu_account=str(cpu_account) if cpu_account else None,
     )
     safe_script = validate_remote_relative_path(script, "script")
     safe_job_name = validate_job_name(job_name) if job_name else None
@@ -1080,6 +1082,7 @@ def slurm_accounts(cluster: str | None = None) -> dict[str, object]:
         "user": user,
         "accounts": submit_accounts(rows),
         "configured_default_account": slurm_info.get("default_account"),
+        "configured_cpu_account": slurm_info.get("cpu_account"),
         "fair_share": rows,
     }
 
@@ -1560,19 +1563,8 @@ def cluster_preflight(
         )
 
     if storage_ok:
-        for root_name, root in roots.items():
-            checks.append(
-                _preflight_remote_check(
-                    current_settings,
-                    target,
-                    f"storage_exists:{root_name}",
-                    ["test", "-d", root],
-                    required=root_name in REQUIRED_ROOT_KEYS,
-                    timeout=15,
-                )
-            )
-
         run_root = roots.get("run_root")
+        # The write check creates run_root/logs, so run it before the existence checks.
         if run_root:
             logs_dir = f"{run_root}/logs"
             if write_check:
@@ -1607,6 +1599,24 @@ def cluster_preflight(
                         timeout=15,
                     )
                 )
+
+        for root_name, root in roots.items():
+            check = _preflight_remote_check(
+                current_settings,
+                target,
+                f"storage_exists:{root_name}",
+                ["test", "-d", root],
+                # Only the code has to be there already; the other folders are made on first use.
+                required=root_name == "remote_repo",
+                timeout=15,
+            )
+            if not check["ok"]:
+                check["hint"] = (
+                    "Clone or sync the code first (remote_git_clone or sync_local_commits)."
+                    if root_name == "remote_repo"
+                    else "Created automatically on first use."
+                )
+            checks.append(check)
 
         remote_repo = roots.get("remote_repo")
         if remote_repo:
