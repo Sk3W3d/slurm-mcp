@@ -49,9 +49,12 @@ class _Targets:
     Subfolders of a configured folder are fine to delete.
     """
 
-    def __init__(self, user: str | None, protected: Iterable[str], cwd: str | None = None) -> None:
+    def __init__(
+        self, user: str | None, protected: Iterable[str], cwd: str | None = None, home: str | None = None
+    ) -> None:
         self.cwd = cwd
-        self.home = f"/home/{user}" if user else None
+        # The real home when known (not always /home/<user>, e.g. /home/j/jzj on tamIA).
+        self.home = home or (f"/home/{user}" if user else None)
         self.scratch = f"/scratch/{user}" if user else None
         self.protected: set[str] = set()
         for path in [*protected, self.home, self.scratch]:
@@ -94,14 +97,16 @@ def check_command(
     user: str | None = None,
     protected: Iterable[str] = (),
     cwd: str | None = None,
+    home: str | None = None,
 ) -> list[str]:
     """Return the reasons a command is refused; an empty list means it may run.
 
     protected lists configured folders (repo, runs, venvs, ...) that must not be
     deleted wholesale, along with every folder above them. cwd is where the
-    command runs, used to resolve relative paths.
+    command runs, used to resolve relative paths. home is the user's real home
+    directory when known (defaults to /home/<user>).
     """
-    targets = _Targets(user, protected, cwd)
+    targets = _Targets(user, protected, cwd, home)
     problems: list[str] = []
     if _PIPE_TO_SHELL.search(command):
         problems.append("Piping a download into a shell (curl/wget ... | sh) is not allowed.")

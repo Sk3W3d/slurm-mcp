@@ -566,10 +566,38 @@ def _record_file(settings: Settings, target: Cluster, project: str) -> str:
     resolved = settings.storage_for(target.name, project)
     root = resolved.values.get("record_root")
     if root is None:
-        if not target.user:
+        home = _remote_home(settings, target, "project_record_sync")
+        if not home:
             raise ValueError(f"Set storage.record_root or the user for cluster '{target.name}'.")
-        root = f"/home/{target.user}/.slurm-mcp/records"
+        root = f"{home}/.slurm-mcp/records"
     return normalize_remote_root(root, "storage.record_root") + f"/{project}.json"
+
+
+_homes: dict[str, str] = {}
+
+
+def _remote_home(settings: Settings, target: Cluster, tool: str) -> str | None:
+    """The user's real home directory on a cluster, asked once and cached.
+
+    Not always /home/<user>: tamIA, for one, uses /home/<initial>/<user>.
+    Falls back to /home/<user> if the cluster cannot be asked.
+    """
+    if target.name in _homes:
+        return _homes[target.name]
+    home = None
+    try:
+        if _route(settings, target) == "robot":
+            home = _robot_sftp(settings, target, tool, lambda client: client.normalize("."), "home directory")
+        else:
+            result = _run_remote_result(settings, target, ["printenv", "HOME"], tool=tool, timeout=15)
+            if result.returncode == 0:
+                home = result.stdout.strip().splitlines()[0] if result.stdout.strip() else None
+    except Exception:
+        home = None
+    if home and home.startswith("/"):
+        _homes[target.name] = home
+        return home
+    return f"/home/{target.user}" if target.user else None
 
 
 _ATOMIC_WRITE_SCRIPT = (
@@ -1350,15 +1378,31 @@ def slurm_accounts(cluster: str | None = None) -> dict[str, object]:
     current_settings = get_settings()
     target = current_settings.get_cluster(cluster)
     user = _remote_user(current_settings, target, tool="slurm_accounts")
-    output = _run_remote_output(current_settings, target, sshare_argv(user), tool="slurm_accounts", timeout=30)
-    rows = parse_sshare(output)
+    result = _run_remote_result(current_settings, target, sshare_argv(user), tool="slurm_accounts", timeout=30)
+    source = "sshare"
+    if result.returncode == 0:
+        rows = parse_sshare(result.stdout)
+        accounts = submit_accounts(rows)
+    elif "not found" in result.stderr:
+        # Some clusters (e.g. killarney) do not install sshare; sacctmgr lists the same associations.
+        output = _run_remote_output(
+            current_settings, target,
+            ["sacctmgr", "-nP", "show", "assoc", f"user={user}", "format=account,partition,qos"],
+            tool="slurm_accounts", timeout=30,
+        )
+        rows = []
+        accounts = submit_accounts([{"account": line.split("|", 1)[0]} for line in output.splitlines() if line.strip()])
+        source = "sacctmgr (no fair-share: sshare is not installed)"
+    else:
+        raise RuntimeError(_command_error(result.returncode, result.stderr) or "sshare failed")
     info = current_settings.cluster_info(target.name)
     slurm_info = info.get("slurm") if isinstance(info.get("slurm"), dict) else {}
     return {
         "cluster": target.name,
         "host": target.host,
         "user": user,
-        "accounts": submit_accounts(rows),
+        "accounts": accounts,
+        "source": source,
         "configured_default_account": slurm_info.get("default_account"),
         "configured_cpu_account": slurm_info.get("cpu_account"),
         "fair_share": rows,
@@ -3251,8 +3295,8 @@ async def run_remote_command(
         "reason": safe_reason,
     }
 
-    home = f"/home/{target.user}" if target.user else None
-    problems = shell_guard.check_command(command, user=target.user, protected=protected, cwd=cwd or home)
+    home = await anyio.to_thread.run_sync(lambda: _remote_home(current_settings, target, "run_remote_command"))
+    problems = shell_guard.check_command(command, user=target.user, protected=protected, cwd=cwd or home, home=home)
     if problems:
         _write_remote_audit(current_settings, {**event, "decision": "refused_by_guard", "problems": problems})
         raise ValueError("Refused: " + " ".join(problems))

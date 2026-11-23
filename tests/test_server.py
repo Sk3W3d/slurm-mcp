@@ -1012,6 +1012,30 @@ class SlurmToolTests(unittest.TestCase):
         self.assertIsNone(server.job_status("43")["estimated_start"])
         self.assertFalse(any("--start" in call for call in server.backend.calls))
 
+    def test_slurm_accounts_falls_back_to_sacctmgr(self) -> None:
+        class NoSshare(RecordingBackend):
+            def run(self, host: str, argv: list[str], *, timeout: int = 60, input_data: bytes | None = None) -> CommandResult:
+                self.calls.append(argv)
+                if argv[0] == "sshare":
+                    return CommandResult(127, "", "bash: line 1: sshare: command not found\n")
+                return CommandResult(0, "aip-pi||interac,normal\naip-pi|gpu|normal\n", "")
+
+        server.backend = NoSshare({})
+        result = server.slurm_accounts()
+        self.assertEqual(result["accounts"], ["aip-pi"])
+        self.assertIn("sacctmgr", result["source"])
+        self.assertEqual(server.backend.calls[1][:4], ["sacctmgr", "-nP", "show", "assoc"])
+
+    def test_record_copy_uses_the_real_home(self) -> None:
+        server._homes.clear()
+        server.backend = RecordingBackend({"printenv": CommandResult(0, "/home/a/alice\n", "")})
+        target = server.get_settings().get_cluster("narval")
+        self.assertEqual(server._record_file(server.get_settings(), target, "p"), "/home/a/alice/.slurm-mcp/records/p.json")
+        server._homes.clear()
+        server.backend = RecordingBackend({"printenv": CommandResult(1, "", "")})
+        self.assertEqual(server._record_file(server.get_settings(), target, "p"), "/home/alice/.slurm-mcp/records/p.json")
+        server._homes.clear()
+
     def test_project_record_can_be_disabled(self) -> None:
         config_path = Path(self._tmp.name) / "no-state.yaml"
         config_path.write_text(

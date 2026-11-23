@@ -153,6 +153,13 @@ class ShellGuardTests(unittest.TestCase):
                 self.assertFalse(approved, command)
                 self.assertIn(why, reason)
 
+    def test_real_home_is_protected_when_not_home_user(self) -> None:
+        # tamIA puts home at /home/<initial>/<user>.
+        refused_here = check_command("rm -rf ~", user="jzj", home="/home/j/jzj")
+        self.assertTrue(refused_here)
+        self.assertTrue(check_command("rm -rf /home/j/jzj", user="jzj", home="/home/j/jzj"))
+        self.assertEqual(check_command("rm -rf /home/j/jzj/tmp-build", user="jzj", home="/home/j/jzj"), [])
+
     def test_extra_trusted_commands(self) -> None:
         self.assertFalse(auto_approvable("uname -a")[0])
         self.assertTrue(auto_approvable("uname -a", extra=["uname"])[0])
