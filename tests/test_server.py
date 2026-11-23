@@ -693,6 +693,33 @@ class ProjectToolTests(unittest.TestCase):
         self.assertNotIn("logs_dir_create", checks)
         self.assertFalse((self.remote / "projects" / "def-nothere").exists())
 
+    def test_symlinked_allocation_folder_counts_as_present(self) -> None:
+        # Alliance allocation folders (~/projects/<group>, /project/<group>) are symlinks.
+        real = self.remote / "lustre" / "6066508"
+        real.mkdir(parents=True)
+        link = self.remote / "def-pi"
+        try:
+            os.symlink(real, link, target_is_directory=True)
+        except OSError as exc:
+            # Windows without symlink privileges: a directory junction is also a link to Git Bash's stat.
+            made = sys.platform == "win32" and subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(real)], capture_output=True, check=False
+            ).returncode == 0
+            if not made:
+                self.skipTest(f"cannot create links here: {exc}")
+        plain = subprocess.run([BASH, "-c", f'stat -c %F "{_posix(link)}"'], capture_output=True, text=True).stdout
+        self.assertEqual(plain.strip(), "symbolic link")  # what the old check saw
+        storage = dict(server.get_settings().cluster_defaults.storage or {})
+        storage["workspace_root"] = _posix(link) + "/me"
+        server.settings = dataclasses.replace(
+            server.get_settings(),
+            cluster_defaults=dataclasses.replace(server.get_settings().cluster_defaults, storage=storage),
+        )
+        server._anchors_ok.clear()
+        server._require_anchor(server.get_settings(), server.get_settings().get_cluster("local"), "alpha", "test")
+        self.assertEqual(server._remote_kind(server.get_settings(), server.get_settings().get_cluster("local"),
+                                             _posix(link), "test"), "dir")
+
     def test_transfers_respect_the_size_cap(self) -> None:
         server.project_use("alpha")
         server.settings = dataclasses.replace(server.get_settings(), max_transfer_bytes=50)

@@ -143,7 +143,8 @@ def remote_size_argv(path: str, excludes: list[str]) -> list[str]:
 
 
 def remote_kind_argv(path: str) -> list[str]:
-    return ["stat", "-c", "%F", "--", path]
+    # -L follows symlinks (allocation folders are symlinks); a dangling link counts as missing.
+    return ["stat", "-L", "-c", "%F", "--", path]
 
 
 def parse_size(output: str) -> int | None:

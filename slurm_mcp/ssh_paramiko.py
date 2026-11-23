@@ -225,7 +225,12 @@ class ParamikoBackend:
                         "and that Alliance has enabled automation access for your account."
                     ) from exc
                 if not transport.is_authenticated():
-                    raise RuntimeError("The automation node asked for more than a key (MFA); it is not usable here.")
+                    raise RuntimeError(
+                        "The automation node accepted the key but still requires MFA, so it is treating it as an "
+                        "ordinary key. Usually the key in CCDB is missing its restrict,from=\"...\",command=\"...\" "
+                        "prefix, or automation access is not active for this account yet. Use cluster_login "
+                        "(Duo) meanwhile."
+                    )
             except Exception:
                 transport.close()
                 raise

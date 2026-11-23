@@ -147,7 +147,8 @@ def read_file_argv(path: str, max_bytes: int) -> list[str]:
 
 
 def stat_file_argv(path: str) -> list[str]:
-    return ["stat", "-c", "%s|%F|%y", "--", path]
+    # -L follows symlinks: Alliance allocation folders (~/projects/<group>, /project/<group>) are symlinks.
+    return ["stat", "-L", "-c", "%s|%F|%y", "--", path]
 
 
 def grep_files_argv(pattern: str, path: str) -> list[str]:
