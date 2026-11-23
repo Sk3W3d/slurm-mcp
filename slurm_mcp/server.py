@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from . import huggingface as hf
 from . import python_env
 from . import remote_tasks
+from . import quota
 from . import robot
 from . import shell_guard
 from . import transfers
@@ -908,6 +909,7 @@ ROBOT_CAPABLE = frozenset(
         "list_jobs", "job_status", "job_history", "cancel_job", "submit_job", "cluster_partitions", "job_logs",
         "tail_job_log", "read_file", "tail_file", "list_run_files", "write_file", "upload_file", "download_file",
         "remote_git_status", "remote_git_rev", "remote_git_branch", "remote_git_fetch", "remote_git_pull",
+        "remote_git_log", "remote_git_diff",
         "remote_git_checkout", "project_status", "cluster_overview", "project_record_sync",
     }
 )
@@ -1067,11 +1069,22 @@ def job_status(job_id: str, cluster: str | None = None) -> dict[str, object]:
     # Accounting has the full picture; a job submitted seconds ago may only be in the queue.
     tracking = _track_jobs(target, accounting or queue)
     record = _ledger_read(lambda ledger: ledger.get_job(target.name, _base_job_id(safe_job_id)), None)
+    estimate = None
+    if any(row.get("state") == "PENDING" for row in queue):
+        # Slurm's own forecast of when a pending job starts ("N/A" until the scheduler has one).
+        start = _run_remote_result(
+            current_settings, target, ["squeue", "-j", safe_job_id, "--start", "--noheader", "--format=%S|%r"],
+            tool="job_status", timeout=30,
+        )
+        if start.returncode == 0 and start.stdout.strip():
+            when, _, reason = start.stdout.strip().splitlines()[0].partition("|")
+            estimate = {"start_time": None if when in {"N/A", "Unknown", ""} else when, "reason": reason or None}
     return {
         "cluster": target.name,
         "host": target.host,
         "job_id": safe_job_id,
         "summary": _job_summary(queue, accounting),
+        "estimated_start": estimate,
         "record": _job_view(record) if record else None,
         "queue": queue,
         "accounting": accounting,
@@ -1349,6 +1362,32 @@ def slurm_accounts(cluster: str | None = None) -> dict[str, object]:
         "configured_default_account": slurm_info.get("default_account"),
         "configured_cpu_account": slurm_info.get("cpu_account"),
         "fair_share": rows,
+    }
+
+
+@mcp.tool()
+def disk_quota(cluster: str | None = None) -> dict[str, object]:
+    """Space and file-count quotas for home, scratch, and project folders (Alliance diskusage_report).
+
+    near_quota marks locations at 90%+ of either limit (or flagged by the
+    cluster). Check before building venvs (about 20,000 files each) or
+    downloading large models into project space. If a group folder is nearly
+    full, tell the user and record it with cluster_note(category="storage").
+    """
+    current_settings = get_settings()
+    target = current_settings.get_cluster(cluster)
+    result = _run_remote_result(
+        current_settings, target, ["bash", "-lc", "diskusage_report"], tool="disk_quota", timeout=120
+    )
+    if result.returncode != 0 and not result.stdout.strip():
+        raise RuntimeError(_command_error(result.returncode, result.stderr) or "diskusage_report failed")
+    rows = quota.parse_diskusage_report(result.stdout)
+    return {
+        "cluster": target.name,
+        "host": target.host,
+        "locations": rows,
+        "near_quota": [row["location"] for row in rows if row["near_quota"]],
+        **({} if rows else {"raw": result.stdout[:4000]}),
     }
 
 
@@ -2371,6 +2410,76 @@ def remote_git_branch(cluster: str | None = None, project: str | None = None) ->
         "remote_repo": remote_repo,
         "branch": branch or None,
         "detached": not bool(branch),
+    }
+
+
+_GIT_LOG_FORMAT = "--format=%H%x1f%h%x1f%an%x1f%aI%x1f%s"
+
+
+@mcp.tool()
+def remote_git_log(
+    cluster: str | None = None,
+    ref: str | None = None,
+    path: str | None = None,
+    limit: int = 20,
+    project: str | None = None,
+) -> dict[str, object]:
+    """Recent commits in the remote repository (newest first), optionally for a ref or a path."""
+    current_settings = get_settings()
+    target, remote_repo, _ = _repo_context(current_settings, cluster, project)
+    safe_limit = validate_limit(limit)
+    argv = ["git", "-C", remote_repo, "log", _GIT_LOG_FORMAT, f"--max-count={safe_limit}"]
+    if ref:
+        argv.append(validate_git_ref(ref))
+    if path:
+        argv.extend(["--", validate_remote_relative_path(path, "path")])
+    output = _run_remote_output(current_settings, target, argv, tool="remote_git_log", timeout=30, strip=False)
+    commits = []
+    for line in output.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) == 5:
+            commits.append(dict(zip(("commit", "short", "author", "date", "subject"), parts, strict=True)))
+    return {"cluster": target.name, "remote_repo": remote_repo, "count": len(commits), "commits": commits}
+
+
+@mcp.tool()
+def remote_git_diff(
+    cluster: str | None = None,
+    base: str | None = None,
+    target_ref: str | None = None,
+    path: str | None = None,
+    stat_only: bool = True,
+    max_bytes: int = 50000,
+    project: str | None = None,
+) -> dict[str, object]:
+    """Diff in the remote repository: uncommitted changes by default, or base vs the working tree, or base vs target_ref.
+
+    stat_only=True (default) gives the per-file summary; set False for the
+    full patch, truncated at max_bytes.
+    """
+    current_settings = get_settings()
+    target, remote_repo, _ = _repo_context(current_settings, cluster, project)
+    if target_ref and not base:
+        raise ValueError("target_ref needs base as well.")
+    safe_max = validate_max_bytes(max_bytes)
+    argv = ["git", "-C", remote_repo, "diff", "--no-color", "--no-ext-diff"]
+    if stat_only:
+        argv.append("--stat")
+    argv.extend(validate_git_ref(ref) for ref in (base, target_ref) if ref)
+    if path:
+        argv.extend(["--", validate_remote_relative_path(path, "path")])
+    output = _run_remote_output(current_settings, target, argv, tool="remote_git_diff", timeout=60, strip=False)
+    truncated = len(output.encode("utf-8")) > safe_max
+    if truncated:
+        output = output.encode("utf-8")[:safe_max].decode("utf-8", "ignore") + "\n[... diff truncated ...]\n"
+    return {
+        "cluster": target.name,
+        "remote_repo": remote_repo,
+        "comparing": f"{base or 'HEAD'} -> {target_ref or 'working tree'}",
+        "stat_only": stat_only,
+        "truncated": truncated,
+        "diff": output,
+        "empty": not output.strip(),
     }
 
 

@@ -234,11 +234,13 @@ below also take `project=`.
 
 **Connection and cluster info:** `cluster_login`, `cluster_logout`,
 `cluster_auth_status`, `cluster_preflight`, `remote_whoami`, `list_clusters`,
-`cluster_info`, `cluster_docs`, `cluster_partitions`, `slurm_accounts`.
+`cluster_info`, `cluster_docs`, `cluster_partitions`, `slurm_accounts`,
+`disk_quota` (space and file-count quotas from `diskusage_report`, with
+near-quota flags), `config_reload`.
 
 **Jobs:** `list_job_profiles`, `submit_job`, `cancel_job` (your own jobs only),
-`list_jobs`, `job_status`, `job_history`, `job_logs`, `tail_job_log`,
-`job_script_template`.
+`list_jobs`, `job_status` (includes Slurm's start estimate for pending jobs),
+`job_history`, `job_logs`, `tail_job_log`, `job_script_template`.
 
 **Files:** `list_run_files`, `read_file`, `tail_file`, `grep_files`,
 `write_file`, `upload_file`, `download_file`. Paths must stay inside the
@@ -268,6 +270,7 @@ Transfers are capped at `max_transfer_bytes`.
   `files_uploaded`, `files_downloaded` or `files_copied`.
 
 **Git:** `remote_git_status`, `remote_git_rev`, `remote_git_branch`,
+`remote_git_log`, `remote_git_diff` (uncommitted changes, or between refs),
 `remote_git_fetch`, `remote_git_pull` (fast-forward only, dry run by default),
 `remote_git_checkout`, `remote_git_clone`, `sync_local_commits`. Tools that
 change files on the cluster refuse to run when the remote repository has

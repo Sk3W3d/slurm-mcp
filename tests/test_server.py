@@ -806,6 +806,26 @@ class ProjectToolTests(unittest.TestCase):
         finally:
             server.config_path = None
 
+    def test_git_log_and_diff(self) -> None:
+        server.project_use("alpha")
+        head = self._sync_project_repo()
+        log = server.remote_git_log()
+        self.assertEqual(log["commits"][0]["commit"], head)
+        self.assertEqual(log["commits"][0]["subject"], "job")
+        self.assertTrue(server.remote_git_diff()["empty"])
+
+        repo = self.remote / "projects" / "alpha"
+        (repo / "job.sh").write_text("#!/bin/bash\necho changed\n", encoding="utf-8", newline="\n")
+        stat = server.remote_git_diff()
+        self.assertIn("job.sh", stat["diff"])
+        self.assertIn("1 file changed", stat["diff"])
+        full = server.remote_git_diff(stat_only=False, path="job.sh")
+        self.assertIn("+echo changed", full["diff"])
+        with self.assertRaises(ValueError):
+            server.remote_git_diff(target_ref="main")  # target_ref needs base
+        with self.assertRaises(ValueError):
+            server.remote_git_log(ref="main..evil")
+
     def test_server_instructions_are_published(self) -> None:
         self.assertIn("project_status", server.mcp.instructions)
         self.assertIn("project_note", server.mcp.instructions)
@@ -961,6 +981,36 @@ class SlurmToolTests(unittest.TestCase):
         result = server.job_history(days=3)
         self.assertEqual([job["job_id"] for job in result["jobs"]], ["2", "1"])
         self.assertIn("-u", server.backend.calls[0])
+
+    def test_disk_quota_structures_the_report(self) -> None:
+        report = (
+            "  Description  Space  # of files\n"
+            "  /home (user alice)   33GB/  50GB   210K/ 500K\n"
+            "  /project (project def-pi)   479GB/1000GB  ->  497K/ 500K\n"
+        )
+        server.backend = RecordingBackend({"bash": CommandResult(0, report, "")})
+        result = server.disk_quota()
+        self.assertEqual(server.backend.calls, [["bash", "-lc", "diskusage_report"]])
+        self.assertEqual(result["near_quota"], ["/project (project def-pi)"])
+        self.assertEqual(len(result["locations"]), 2)
+
+    def test_job_status_reports_start_estimate_for_pending_jobs(self) -> None:
+        class Pending(RecordingBackend):
+            def run(self, host: str, argv: list[str], *, timeout: int = 60, input_data: bytes | None = None) -> CommandResult:
+                self.calls.append(argv)
+                if argv[0] == "squeue" and "--start" in argv:
+                    return CommandResult(0, "2026-11-23T09:30:00|Priority\n", "")
+                if argv[0] == "squeue":
+                    return CommandResult(0, "42|gpu|train|alice|PENDING|0:00|30:00|1|4|32G|(Priority)\n", "")
+                return CommandResult(0, "", "")
+
+        server.backend = Pending({})
+        status = server.job_status("42")
+        self.assertEqual(status["estimated_start"], {"start_time": "2026-11-23T09:30:00", "reason": "Priority"})
+
+        server.backend = RecordingBackend({"squeue": CommandResult(0, "43|gpu|x|alice|RUNNING|1:00|30:00|1|4|32G|n1\n", "")})
+        self.assertIsNone(server.job_status("43")["estimated_start"])
+        self.assertFalse(any("--start" in call for call in server.backend.calls))
 
     def test_project_record_can_be_disabled(self) -> None:
         config_path = Path(self._tmp.name) / "no-state.yaml"
