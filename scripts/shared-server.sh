@@ -89,7 +89,7 @@ stop() {
         while kill -0 "$pid" 2>/dev/null && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
         kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
         rm -f "$pidfile"
-        echo "Stopped (pid $pid). Open SSH connections are closed; the next login needs Duo."
+        echo "Stopped (pid $pid). Paramiko connections are closed (the next login needs Duo); OpenSSH ControlMaster connections stay open."
     elif listening; then
         echo "Something is listening on port $port but was not started by this script (systemd?). Try: systemctl --user stop alliance-slurm-mcp" >&2
         exit 1

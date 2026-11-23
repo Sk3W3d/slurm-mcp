@@ -845,6 +845,27 @@ class ProjectToolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "No project selected"):
             server.submit_job("cpu", "job.sh", dry_run=True)
 
+    def test_shell_needs_no_project(self) -> None:
+        server.settings = dataclasses.replace(server.get_settings(), allow_remote_shell=True)
+        self._fixture("squeue.out", "555|cpu|other|tester|PENDING|0:00|10:00|1|2|1G|(None)\n")
+        reason = "user asked to run this exact squeue command"
+        result = anyio.run(lambda: server.run_remote_command("squeue -u tester", reason=reason))
+        self.assertEqual(result["returncode"], 0)
+        self.assertIn("555|cpu", result["stdout"])
+        self.assertEqual(result["cwd"], "~")
+        self.assertIn("No project selected", result["cwd_note"])
+        home = anyio.run(lambda: server.run_remote_command("squeue", reason=reason, cwd_base="home"))
+        self.assertNotIn("cwd_note", home)
+
+        # The folder that holds every project's repo stays protected without a project.
+        server.settings = dataclasses.replace(server.get_settings(), remote_shell_auto_approve=True)
+        with self.assertRaisesRegex(ValueError, "Refused: Recursive rm"):
+            anyio.run(
+                lambda: server.run_remote_command(
+                    f"rm -rf {_posix(self.remote)}/projects", reason="testing the guard without a project"
+                )
+            )
+
     def test_projects_are_isolated_and_active_project_is_the_default(self) -> None:
         server.write_file("notes.txt", "alpha\n", project="alpha")
         server.project_use("beta")

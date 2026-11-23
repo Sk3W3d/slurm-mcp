@@ -3306,7 +3306,8 @@ async def run_remote_command(
     (ls, cat, head, tail, grep, find, du, ...), joined by pipes or &&, with no
     output redirection or $(...). Everything else is shown to the user for
     approval first (unless the config sets remote_shell_auto_approve). It runs in the project's remote_repo (or
-    cwd_base) with a timeout of at most 600 s. Login nodes are shared, so
+    cwd_base; "home" for the home folder) with a timeout of at most 600 s. No project is needed: without
+    one it runs in the home folder, which is fine for cluster-wide queries such as squeue -u <user>. Login nodes are shared, so
     nothing heavy: no training, big preprocessing, or long compiles.
     Clearly destructive commands are refused even when approved:
     recursive deletion of configured folders or anything above them, scancel,
@@ -3323,19 +3324,38 @@ async def run_remote_command(
         raise ValueError("reason is required: say in a sentence why no dedicated tool can do this.")
     if not isinstance(timeout, int) or timeout < 1 or timeout > 600:
         raise ValueError("timeout must be between 1 and 600 seconds.")
-    target, roots = _file_context(current_settings, cluster, project)
-    configured_cwd = resolve_remote_path(None, roots, base=validate_file_base(cwd_base), label="cwd").path
-    cwd: str | None = configured_cwd
+    # Cluster-wide queries (squeue, sinfo, diskusage_report) need no project, so a
+    # missing one only means there is no project folder to start in.
+    target, roots = _file_context(current_settings, cluster, project, require_project=False)
+    cwd: str | None = None
     cwd_note = None
-    # On a cluster where nothing has been set up yet the folder may not exist; run from
-    # home rather than failing every command, and say so.
-    if await anyio.to_thread.run_sync(
-        lambda: _remote_kind(current_settings, target, configured_cwd, "run_remote_command")
-    ) != "dir":
-        cwd = None
-        cwd_note = f"{configured_cwd} does not exist yet, so the command ran in your home folder."
+    if cwd_base != "home":
+        validate_file_base(cwd_base)
+        if cwd_base in roots:
+            configured_cwd = roots[cwd_base]
+            # On a cluster where nothing has been set up yet the folder may not exist; run
+            # from home rather than failing every command, and say so.
+            if await anyio.to_thread.run_sync(
+                lambda: _remote_kind(current_settings, target, configured_cwd, "run_remote_command")
+            ) == "dir":
+                cwd = configured_cwd
+            else:
+                cwd_note = f"{configured_cwd} does not exist yet, so the command ran in your home folder."
+        elif cwd_base in roots.pending:
+            cwd_note = f"No project selected, so storage.{cwd_base} is unknown and the command ran in your home folder."
+        else:
+            cwd_note = f"storage.{cwd_base} is not configured, so the command ran in your home folder."
     storage = roots.info.get("storage", {})
     protected = [value for value in storage.values() if isinstance(value, str) and value.startswith("/")]
+    if roots.pending:
+        # Without a project the project folders are unknown, but their common parents
+        # (e.g. ~/projects) must stay protected from recursive deletion.
+        placeholder = current_settings.storage_for(target.name, "slurm-mcp-any-project").values
+        protected += [
+            str(PurePosixPath(placeholder[key]).parent)
+            for key in roots.pending
+            if isinstance(placeholder.get(key), str) and placeholder[key].startswith("/")
+        ]
     event = {
         "tool": "run_remote_command",
         "cluster": target.name,

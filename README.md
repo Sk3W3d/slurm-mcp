@@ -51,7 +51,11 @@ The server has two ways to reuse your Duo-approved login (`ssh_backend` in
   (with `duo_option`, or the passcode you give), and refuses password,
   key-passphrase and unknown-host-key prompts. Keys with a passphrase must be
   in ssh-agent. You can also start it yourself with `ssh -MNf narval`, and
-  check it with `ssh -O check narval`.
+  check it with `ssh -O check narval`. `ControlPersist` counts idle time:
+  the connection closes once nothing has used it for that long (every tool
+  call resets it), and it outlives restarts of the MCP server. Raise it (e.g.
+  `48h`) to need Duo less often, at the cost of a longer Duo-free window for
+  anyone using your local account.
 
 ## 2. Install and configure
 
@@ -312,6 +316,9 @@ off unless `allow_remote_shell: true`. When it's on:
   `scontrol update` still need approval. The list is `READ_ONLY_COMMANDS` in
   `slurm_mcp/shell_guard.py`. `remote_shell_readonly_commands` adds names you
   trust, and `remote_shell_auto_approve_readonly: false` turns this off.
+- **No project is needed.** It runs in the project's `remote_repo` (or
+  `cwd_base`); without a project, or with `cwd_base="home"`, it runs in your
+  home folder, which suits cluster-wide queries such as `squeue -u <user>`.
 - **You approve every other command.** The server shows the command,
   cluster, folder, the agent's reason and why approval is needed, through MCP
   elicitation (a dialog in Claude Code). If you decline or cancel, or the
