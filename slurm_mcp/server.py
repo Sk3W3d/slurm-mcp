@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import shlex
 import sqlite3
+import stat as stat_module
 import tempfile
+import time
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
@@ -18,6 +21,7 @@ from pydantic import BaseModel, Field
 from . import huggingface as hf
 from . import python_env
 from . import remote_tasks
+from . import robot
 from . import shell_guard
 from . import transfers
 from .audit import preview_text, write_audit_event
@@ -30,6 +34,7 @@ from .remote_files import (
     allowed_roots_from_storage,
     classify_job_log,
     find_job_logs_argv,
+    job_log_patterns,
     grep_files_argv,
     list_files_argv,
     normalize_remote_root,
@@ -98,7 +103,16 @@ SERVER_INSTRUCTIONS = """\
 Runs work on Alliance Canada Slurm clusters through the user's 2FA SSH login.
 
 Connecting: if a tool says the cluster is not connected, call cluster_login and \
-tell the user to approve the Duo push on their phone.
+tell the user to approve the Duo push on their phone. Some clusters also have \
+an automation node (cluster_auth_status shows robot.enabled): it needs no Duo \
+but only covers simple work (job status, logs, file reads/writes, submit and \
+cancel, git status/pull). Tools use it on their own when there is no login \
+connection. Prefer it for monitoring and small file work so the user is not \
+asked for Duo repeatedly; use cluster_login(method="login") for anything else \
+(shell commands, venv builds, HF downloads, directory transfers, syncing \
+code). Check recent_logins in cluster_auth_status: if Duo pushes keep timing \
+out, say so rather than retrying in a loop. Never retry a failed login \
+repeatedly; clusters throttle repeated logins.
 
 Projects: work is organised by project. Before working on one, call \
 project_use(name) and then project_status() to learn where its code and runs \
@@ -628,10 +642,9 @@ def _sync_record_file(
     """Pull a JSON record file from the cluster (if present), merge it, and write the merged copy back."""
     tool = "project_record_sync"
     pulled: Any = None
-    exists = _run_remote_result(settings, target, ["test", "-f", path], tool=tool, timeout=15)
-    if exists.returncode == 0:
-        metadata = parse_stat_output(_run_remote_output(settings, target, stat_file_argv(path), tool=tool, timeout=15))
-        size = metadata.get("size_bytes")
+    kind, size = _remote_file_info(settings, target, path, tool)
+    existed = kind == "file"
+    if existed:
         if isinstance(size, int):
             check_transfer_size(size, settings.max_transfer_bytes, f"{label} on the cluster")
         content = _run_remote_output(settings, target, ["cat", "--", path], tool=tool, timeout=60, strip=False)
@@ -642,12 +655,23 @@ def _sync_record_file(
         pulled = merge(snapshot)
     data = json.dumps(export(), indent=1, sort_keys=True).encode("utf-8")
     check_transfer_size(len(data), settings.max_transfer_bytes, label)
-    _run_remote_output(
-        settings, target, ["bash", "-c", _ATOMIC_WRITE_SCRIPT, "_", path], tool=tool, timeout=60, input_data=data
-    )
+    if _route(settings, target) == "robot":
+
+        def write(client: Any) -> None:
+            _sftp_makedirs(client, remote_parent(path))
+            partial = f"{path}.{transfers.transfer_name('.part')[1:]}"
+            with client.open(partial, "wb") as handle:
+                handle.write(data)
+            client.posix_rename(partial, path)  # atomic replace, like the login-node path
+
+        _robot_sftp(settings, target, tool, write, f"write {path}")
+    else:
+        _run_remote_output(
+            settings, target, ["bash", "-c", _ATOMIC_WRITE_SCRIPT, "_", path], tool=tool, timeout=60, input_data=data
+        )
     if pulled is None:
         pulled = {"events": 0, "jobs": 0, "tasks": 0, "locations": 0} if label == "Project record" else 0
-    return exists.returncode == 0, pulled, data
+    return existed, pulled, data
 
 
 CLUSTER_NOTE_CATEGORIES = ("preference", "hardware", "queue", "account", "storage", "software", "issue", "tip")
@@ -839,41 +863,112 @@ def cluster_docs(cluster: str | None = None) -> list[dict[str, object]]:
 
 @mcp.tool()
 def cluster_auth_status(cluster: str | None = None) -> dict[str, object]:
-    """Check whether an SSH master connection is alive for a cluster."""
+    """Connection state for a cluster: the interactive login, the automation node, and recent history.
+
+    Use it to choose how to connect. The login node (Duo) can do everything;
+    the automation node (no Duo, if enabled) covers ROBOT_CAPABLE work such as
+    job status, logs, file reads/writes, submit/cancel, and git status/pull.
+    history shows how recent logins went (e.g. Duo pushes that timed out).
+    """
     current_settings = get_settings()
     target = current_settings.get_cluster(cluster)
     result = get_backend().check(target.host)
     message = (result.stderr or result.stdout).strip()
+    configured = _robot_configured(current_settings, target)
+    failure = _robot_failures.get(target.name)
+    history = _ledger_read(lambda ledger: ledger.events(project=ANY, cluster=target.name, kind="connection", limit=20), [])
+    summary: dict[str, dict[str, Any]] = {}
+    for item in history:
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        stats = summary.setdefault(data.get("method", "?"), {"attempts": 0, "succeeded": 0, "last": None})
+        stats["attempts"] += 1
+        stats["succeeded"] += int(bool(data.get("ok")))
+        stats["last"] = stats["last"] or {"ts": item["ts"], "ok": data.get("ok"), "error": data.get("error")}
     return {
         "cluster": target.name,
         "host": target.host,
         "connected": result.returncode == 0,
         "message": message,
         "backend": get_backend().name,
+        "robot": {
+            "host": target.robot_host,
+            "enabled": configured,
+            "connected": _robot_alive(target) if configured else False,
+            "fallback_on_mfa_timeout": current_settings.robot_fallback_on_mfa_timeout,
+            **({"last_failure": {"seconds_ago": int(time.time() - failure[0]), "error": failure[1]}} if failure else {}),
+            "capable_tools": sorted(ROBOT_CAPABLE) if configured else [],
+        },
+        "recent_logins": summary,
     }
 
 
-@mcp.tool()
-async def cluster_login(cluster: str | None = None, passcode: str | None = None) -> dict[str, object]:
-    """Open an authenticated SSH connection to a cluster (paramiko backend).
+# Tools whose commands the automation node accepts (single Slurm/git/file commands, or SFTP).
+ROBOT_CAPABLE = frozenset(
+    {
+        "list_jobs", "job_status", "job_history", "cancel_job", "submit_job", "cluster_partitions", "job_logs",
+        "tail_job_log", "read_file", "tail_file", "list_run_files", "write_file", "upload_file", "download_file",
+        "remote_git_status", "remote_git_rev", "remote_git_branch", "remote_git_fetch", "remote_git_pull",
+        "remote_git_checkout", "project_status", "cluster_overview", "project_record_sync",
+    }
+)
+_LOGIN_METHODS = ("auto", "login", "robot")
 
-    Uses your SSH key, then answers the Alliance Duo prompt by sending a push
-    (or the given one-time passcode). Tell the user to approve the Duo push on
-    their phone; this call waits up to two minutes for it. With the openssh
-    backend this only reports whether a ControlMaster session exists.
+
+@mcp.tool()
+async def cluster_login(
+    cluster: str | None = None,
+    passcode: str | None = None,
+    method: str = "auto",
+) -> dict[str, object]:
+    """Connect to a cluster.
+
+    method="login": the interactive login node with your SSH key plus the
+    Alliance Duo prompt (a push, or the given one-time passcode). Tell the user
+    to approve the push; this waits up to two minutes. Full capabilities.
+    method="robot": the cluster's automation node with the constrained key, no
+    Duo. Only for clusters with robot_host and robot_enabled; covers job
+    status, logs, file reads/writes, submit/cancel, and git status/pull.
+    method="auto" (default): the login node; if the Duo push is not approved in
+    time and robot_fallback_on_mfa_timeout is on, the automation node instead.
+
+    Tools also use a connected or enabled automation node on their own when no
+    login connection exists. cluster_auth_status shows both and their history.
     """
+    if method not in _LOGIN_METHODS:
+        raise ValueError(f"method must be one of: {', '.join(_LOGIN_METHODS)}.")
     current_settings = get_settings()
     target = current_settings.get_cluster(cluster)
+    if method == "robot":
+        result = await anyio.to_thread.run_sync(lambda: _connect_robot(current_settings, target))
+        return {"cluster": target.name, "host": target.robot_host, "via": "robot", **result,
+                "capable_tools": sorted(ROBOT_CAPABLE)}
+
     event: dict[str, Any] = {"tool": "cluster_login", "cluster": target.name, "host": target.host}
+    start = time.time()
     try:
         result = await anyio.to_thread.run_sync(
             lambda: get_backend().login(target.host, passcode=passcode or None)
         )
     except Exception as exc:
         _write_remote_audit(current_settings, {**event, "exception": repr(exc)})
+        _record_connection(target, "login", False, time.time() - start, str(exc))
+        if method == "auto" and current_settings.robot_fallback_on_mfa_timeout and _robot_configured(current_settings, target):
+            fallback = await anyio.to_thread.run_sync(lambda: _connect_robot(current_settings, target))
+            return {
+                "cluster": target.name,
+                "host": target.robot_host,
+                "via": "robot",
+                "login_error": str(exc),
+                "note": "The Duo login did not complete, so the automation node is connected instead. It covers "
+                "capable_tools only; call cluster_login(method='login') for anything else.",
+                "capable_tools": sorted(ROBOT_CAPABLE),
+                **fallback,
+            }
         raise
+    if not result.get("reused"):
+        _record_connection(target, "login", True, time.time() - start)
     _write_remote_audit(current_settings, {**event, "connected": result.get("connected")})
-    return {"cluster": target.name, "host": target.host, "backend": get_backend().name, **result}
+    return {"cluster": target.name, "host": target.host, "backend": get_backend().name, "via": "login", **result}
 
 
 @mcp.tool()
@@ -1084,20 +1179,18 @@ def submit_job(
             tool="submit_job",
             timeout=30,
         )
-    _run_remote_output(
-        current_settings,
-        target,
-        ["test", "-f", safe_script],
-        tool="submit_job",
-        cwd=remote_repo,
-        timeout=30,
-    )
+    script_path = f"{remote_repo}/{safe_script}"
+    if _remote_kind(current_settings, target, script_path, "submit_job") != "file":
+        raise ValueError(f"Job script not found on {target.name}: {script_path}")
+    # --chdir and an absolute script path instead of a working directory, so the same
+    # command also runs on an automation node (which cannot cd first).
+    script_index = len(argv) - 1 - len(safe_script_args)  # build_sbatch_argv puts the script before its args
+    submit_argv = [argv[0], f"--chdir={remote_repo}", *argv[1:script_index], script_path, *argv[script_index + 1 :]]
     stdout = _run_remote_output(
         current_settings,
         target,
-        argv,
+        submit_argv,
         tool="submit_job",
-        cwd=remote_repo,
         timeout=30,
     )
     job_id = parse_sbatch_job_id(stdout)
@@ -1273,15 +1366,22 @@ def list_run_files(
     safe_limit = validate_limit(limit)
     safe_depth = validate_max_depth(max_depth)
     resolved = resolve_remote_path(path, roots, base="run_root", label="path")
-    output = _run_remote_output(
-        current_settings,
-        target,
-        list_files_argv(resolved.path, safe_depth),
-        tool="list_run_files",
-        timeout=60,
-        strip=False,
-    )
-    files = parse_file_listing(output, roots, safe_limit)
+    if _route(current_settings, target) == "robot":
+        found = _robot_sftp(
+            current_settings, target, "list_run_files",
+            lambda client: _sftp_walk(client, resolved.path, safe_depth), f"walk {resolved.path}",
+        )
+        files = _listing(found, roots, safe_limit)
+    else:
+        output = _run_remote_output(
+            current_settings,
+            target,
+            list_files_argv(resolved.path, safe_depth),
+            tool="list_run_files",
+            timeout=60,
+            strip=False,
+        )
+        files = parse_file_listing(output, roots, safe_limit)
     return {
         "cluster": target.name,
         "host": target.host,
@@ -1309,22 +1409,29 @@ def read_file(
     safe_base = validate_file_base(base)
     safe_max_bytes = validate_max_bytes(max_bytes)
     resolved = resolve_remote_path(path, roots, base=safe_base, label="path")
-    metadata_result = _run_remote_result(
-        current_settings,
-        target,
-        stat_file_argv(resolved.path),
-        tool="read_file",
-        timeout=15,
-    )
-    content = _run_remote_output(
-        current_settings,
-        target,
-        read_file_argv(resolved.path, safe_max_bytes),
-        tool="read_file",
-        timeout=30,
-        strip=False,
-    )
-    metadata = parse_stat_output(metadata_result.stdout) if metadata_result.returncode == 0 else {}
+    if _route(current_settings, target) == "robot":
+        content, size = _robot_sftp(
+            current_settings, target, "read_file",
+            lambda client: _sftp_head(client, resolved.path, safe_max_bytes), f"read {resolved.path}",
+        )
+        metadata: dict[str, Any] = {"size_bytes": size, "file_type": "regular file", "modified_time": None}
+    else:
+        metadata_result = _run_remote_result(
+            current_settings,
+            target,
+            stat_file_argv(resolved.path),
+            tool="read_file",
+            timeout=15,
+        )
+        content = _run_remote_output(
+            current_settings,
+            target,
+            read_file_argv(resolved.path, safe_max_bytes),
+            tool="read_file",
+            timeout=30,
+            strip=False,
+        )
+        metadata = parse_stat_output(metadata_result.stdout) if metadata_result.returncode == 0 else {}
     size_bytes = metadata.get("size_bytes")
     return {
         "cluster": target.name,
@@ -1353,14 +1460,7 @@ def tail_file(
     safe_base = validate_file_base(base)
     safe_lines = validate_line_count(lines)
     resolved = resolve_remote_path(path, roots, base=safe_base, label="path")
-    content = _run_remote_output(
-        current_settings,
-        target,
-        tail_file_argv(resolved.path, safe_lines),
-        tool="tail_file",
-        timeout=30,
-        strip=False,
-    )
+    content = _tail(current_settings, target, resolved.path, safe_lines, "tail_file")
     return {
         "cluster": target.name,
         "host": target.host,
@@ -1452,14 +1552,7 @@ def tail_job_log(
     safe_lines = validate_line_count(lines)
     files = _job_log_files(current_settings, target, roots, safe_job_id, limit=20)
     selected = select_job_log(files, stream)
-    content = _run_remote_output(
-        current_settings,
-        target,
-        tail_file_argv(str(selected["path"]), safe_lines),
-        tool="tail_job_log",
-        timeout=30,
-        strip=False,
-    )
+    content = _tail(current_settings, target, str(selected["path"]), safe_lines, "tail_job_log")
     return {
         "cluster": target.name,
         "host": target.host,
@@ -1500,16 +1593,29 @@ def write_file(
     if len(data) > _WRITE_FILE_MAX_BYTES:
         raise ValueError(f"content is larger than {_WRITE_FILE_MAX_BYTES} bytes; use upload_file instead.")
     _require_anchor(current_settings, target, roots.project, "write_file")
-    result = _run_remote_result(
-        current_settings,
-        target,
-        write_file_argv(resolved.path, executable=executable, overwrite=overwrite),
-        tool="write_file",
-        timeout=60,
-        input_data=data,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "remote write failed")
+    if _route(current_settings, target) == "robot":
+
+        def write(client: Any) -> None:
+            if not overwrite and _sftp_kind(client, resolved.path) is not None:
+                raise RuntimeError(f"Refusing to overwrite existing file: {resolved.path}")
+            _sftp_makedirs(client, remote_parent(resolved.path))
+            with client.open(resolved.path, "wb") as handle:
+                handle.write(data)
+            if executable:
+                client.chmod(resolved.path, client.stat(resolved.path).st_mode | 0o111)
+
+        _robot_sftp(current_settings, target, "write_file", write, f"write {resolved.path}")
+    else:
+        result = _run_remote_result(
+            current_settings,
+            target,
+            write_file_argv(resolved.path, executable=executable, overwrite=overwrite),
+            tool="write_file",
+            timeout=60,
+            input_data=data,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "remote write failed")
     return {
         "cluster": target.name,
         "host": target.host,
@@ -1543,22 +1649,31 @@ def upload_file(
         raise ValueError("remote_path must name a file inside the root, not the root itself.")
 
     _require_anchor(current_settings, target, roots.project, "upload_file")
-    precheck = 'mkdir -p -- "$1"'
-    if not overwrite:
-        precheck += ' && if [ -e "$2" ]; then echo "Refusing to overwrite existing file: $2" >&2; exit 17; fi'
-    _run_remote_output(
-        current_settings,
-        target,
-        ["bash", "-c", precheck, "_", remote_parent(resolved.path), resolved.path],
-        tool="upload_file",
-        timeout=30,
-    )
+    if _route(current_settings, target) == "robot":
+
+        def prepare(client: Any) -> None:
+            if not overwrite and _sftp_kind(client, resolved.path) is not None:
+                raise RuntimeError(f"Refusing to overwrite existing file: {resolved.path}")
+            _sftp_makedirs(client, remote_parent(resolved.path))
+
+        _robot_sftp(current_settings, target, "upload_file", prepare, f"prepare {resolved.path}")
+    else:
+        precheck = 'mkdir -p -- "$1"'
+        if not overwrite:
+            precheck += ' && if [ -e "$2" ]; then echo "Refusing to overwrite existing file: $2" >&2; exit 17; fi'
+        _run_remote_output(
+            current_settings,
+            target,
+            ["bash", "-c", precheck, "_", remote_parent(resolved.path), resolved.path],
+            tool="upload_file",
+            timeout=30,
+        )
     _transfer(
         current_settings,
         target,
         "upload_file",
         {"local_path": str(source), "remote_path": resolved.path, "bytes": size},
-        lambda: get_backend().upload(target.host, source, resolved.path),
+        lambda: get_backend().upload(_transfer_host(current_settings, target), source, resolved.path),
     )
     return {
         "cluster": target.name,
@@ -1604,12 +1719,9 @@ def download_file(
     if destination.exists() and not overwrite:
         raise ValueError(f"Local file already exists: {destination}. Pass overwrite=True to replace it.")
 
-    metadata = parse_stat_output(
-        _run_remote_output(current_settings, target, stat_file_argv(resolved.path), tool="download_file", timeout=15)
-    )
-    if metadata.get("file_type") not in {"regular file", "regular empty file"}:
+    kind, size = _remote_file_info(current_settings, target, resolved.path, "download_file")
+    if kind != "file":
         raise ValueError(f"Remote path is not a regular file: {resolved.path}")
-    size = metadata.get("size_bytes")
     if isinstance(size, int):
         check_transfer_size(size, current_settings.max_transfer_bytes, "Remote file")
 
@@ -1619,7 +1731,7 @@ def download_file(
         target,
         "download_file",
         {"remote_path": resolved.path, "local_path": str(destination), "bytes": size},
-        lambda: get_backend().download(target.host, resolved.path, destination),
+        lambda: get_backend().download(_transfer_host(current_settings, target), resolved.path, destination),
     )
     return {
         "cluster": target.name,
@@ -1669,6 +1781,8 @@ def _human_bytes(count: int | None) -> str:
 
 def _remote_kind(settings: Settings, target: Cluster, path: str, tool: str) -> str | None:
     """'dir', 'file', another stat type (e.g. 'symbolic link'), or None if the path does not exist."""
+    if _route(settings, target) == "robot":
+        return _robot_sftp(settings, target, tool, lambda client: _sftp_kind(client, path), f"stat {path}")
     result = _run_remote_result(settings, target, transfers.remote_kind_argv(path), tool=tool, timeout=15)
     if result.returncode != 0:
         return None
@@ -1708,7 +1822,7 @@ def _push_archive(
             target,
             tool,
             {**details, "local_path": str(archive), "remote_path": remote_archive, "bytes": archive.stat().st_size},
-            lambda: get_backend().upload(target.host, archive, remote_archive),
+            lambda: get_backend().upload(_transfer_host(settings, target), archive, remote_archive),
         )
     except Exception:
         _run_remote_result(settings, target, ["rm", "-f", "--", remote_archive], tool=tool, timeout=30)
@@ -1742,7 +1856,7 @@ def _pull_archive(
             target,
             tool,
             {"remote_path": remote_archive, "local_path": str(local_archive), "bytes": size},
-            lambda: get_backend().download(target.host, remote_archive, local_archive),
+            lambda: get_backend().download(_transfer_host(settings, target), remote_archive, local_archive),
         )
         return size
     finally:
@@ -1952,7 +2066,7 @@ def copy_between_clusters(
                 _transfer(
                     current_settings, src_target, tool,
                     {"remote_path": src.path, "local_path": str(local_file), "bytes": size},
-                    lambda: get_backend().download(src_target.host, src.path, local_file),
+                    lambda: get_backend().download(_transfer_host(current_settings, src_target), src.path, local_file),
                 )
                 parent = remote_parent(dst.path)
                 partial = f"{parent}/{transfers.transfer_name('.part')}"
@@ -1961,7 +2075,7 @@ def copy_between_clusters(
                     _transfer(
                         current_settings, dst_target, tool,
                         {"local_path": str(local_file), "remote_path": partial, "bytes": size},
-                        lambda: get_backend().upload(dst_target.host, local_file, partial),
+                        lambda: get_backend().upload(_transfer_host(current_settings, dst_target), local_file, partial),
                     )
                     # Rename into place so the destination is never half-written.
                     _run_remote_output(
@@ -2556,7 +2670,7 @@ def sync_local_commits(
                 target,
                 "sync_local_commits",
                 {"local_path": str(bundle_path), "remote_path": remote_bundle, "bytes": size},
-                lambda: get_backend().upload(target.host, bundle_path, remote_bundle),
+                lambda: get_backend().upload(_transfer_host(current_settings, target), bundle_path, remote_bundle),
             )
         base["bundle_bytes"] = size
         try:
@@ -3421,24 +3535,25 @@ def _remote_git_status(settings: Settings, target: Cluster, remote_repo: str, to
     return parse_git_status(output)
 
 
-_REPO_SNAPSHOT_SCRIPT = (
-    'c=$(git -C "$1" rev-parse --verify --quiet HEAD 2>/dev/null) || exit 0; '
-    'echo "$c"; git -C "$1" status --porcelain 2>/dev/null | head -n 1'
-)
-
-
 def _repo_snapshot(settings: Settings, target: Cluster, remote_repo: str, *, tool: str) -> tuple[str | None, bool | None]:
-    """Commit the remote repo is at and whether it has uncommitted changes; (None, None) if not a Git repo."""
+    """Commit the remote repo is at and whether it has uncommitted changes; (None, None) if not a Git repo.
+
+    Two plain git commands (no shell), so this also works on an automation node.
+    """
     try:
-        result = _run_remote_result(
-            settings, target, ["bash", "-c", _REPO_SNAPSHOT_SCRIPT, "_", remote_repo], tool=tool, timeout=30
+        rev = _run_remote_result(
+            settings, target, ["git", "-C", remote_repo, "rev-parse", "--verify", "--quiet", "HEAD"], tool=tool,
+            timeout=30,
+        )
+        if rev.returncode != 0 or not rev.stdout.strip():
+            return None, None
+        status = _run_remote_result(
+            settings, target, ["git", "-C", remote_repo, "status", "--porcelain"], tool=tool, timeout=30
         )
     except Exception:
         return None, None
-    lines = result.stdout.splitlines()
-    if result.returncode != 0 or not lines or not lines[0].strip():
-        return None, None
-    return lines[0].strip(), len(lines) > 1 and bool(lines[1].strip())
+    dirty = bool(status.stdout.strip()) if status.returncode == 0 else None
+    return rev.stdout.strip().splitlines()[0], dirty
 
 
 def _validate_note(value: str | None, label: str, max_chars: int) -> str | None:
@@ -3543,15 +3658,27 @@ def _job_log_files(
     limit: int,
 ) -> list[dict[str, Any]]:
     run_root = resolve_remote_path(None, roots, base="run_root", label="run_root")
-    output = _run_remote_output(
-        settings,
-        target,
-        find_job_logs_argv(run_root.path, job_id),
-        tool="job_logs",
-        timeout=60,
-        strip=False,
-    )
-    files = parse_file_listing(output, roots, limit)
+    if _route(settings, target) == "robot":
+        patterns = job_log_patterns(job_id)
+        found = _robot_sftp(
+            settings, target, "job_logs",
+            lambda client: [
+                item for item in _sftp_walk(client, run_root.path, 3)  # same depth as find -maxdepth 3
+                if any(fnmatch.fnmatch(item[0].rsplit("/", 1)[-1], pattern) for pattern in patterns)
+            ],
+            f"find logs of {job_id} under {run_root.path}",
+        )
+        files = _listing(found, roots, limit)
+    else:
+        output = _run_remote_output(
+            settings,
+            target,
+            find_job_logs_argv(run_root.path, job_id),
+            tool="job_logs",
+            timeout=60,
+            strip=False,
+        )
+        files = parse_file_listing(output, roots, limit)
     return [{**file_info, "stream": classify_job_log(str(file_info["path"]), job_id)} for file_info in files]
 
 
@@ -3590,8 +3717,13 @@ def _run_remote_result(
         "argv": argv,
     }
     try:
-        remote_argv = argv if cwd is None else argv_in_dir(cwd, argv)
-        result = get_backend().run(target.host, remote_argv, timeout=timeout, input_data=input_data)
+        route = _route(settings, target)
+        event["via"] = route
+        if route == "robot":
+            result = _run_on_robot(target, argv, tool=tool, timeout=timeout, cwd=cwd, input_data=input_data)
+        else:
+            remote_argv = argv if cwd is None else argv_in_dir(cwd, argv)
+            result = get_backend().run(target.host, remote_argv, timeout=timeout, input_data=input_data)
     except Exception as exc:
         _write_remote_audit(settings, {**event, "exception": repr(exc)})
         raise
@@ -3606,6 +3738,247 @@ def _run_remote_result(
         },
     )
     return result
+
+
+# -- automation ("robot") nodes ---------------------------------------------------------------
+
+_ROBOT_RETRY_AFTER = 600  # seconds to wait after a failed automation login before trying again
+_robot_failures: dict[str, tuple[float, str]] = {}
+
+
+def _robot_key(target: Cluster) -> str:
+    return f"robot:{target.name}"
+
+
+def _robot_configured(settings: Settings, target: Cluster) -> bool:
+    return bool(settings.robot_enabled and target.robot_host and hasattr(get_backend(), "login_robot"))
+
+
+def _login_alive(target: Cluster) -> bool:
+    try:
+        return get_backend().check(target.host).returncode == 0
+    except Exception:
+        return False
+
+
+def _robot_alive(target: Cluster) -> bool:
+    backend = get_backend()
+    if not hasattr(backend, "login_robot"):
+        return False
+    try:
+        return backend.check(_robot_key(target)).returncode == 0
+    except Exception:
+        return False
+
+
+def _record_connection(target: Cluster, method: str, ok: bool, seconds: float, error: str | None = None) -> None:
+    summary = f"{method} login to {target.name} " + (f"succeeded in {seconds:.0f}s" if ok else f"failed: {error}")
+    _record(
+        lambda ledger: ledger.add_event(
+            "connection", summary, project=None, cluster=target.name,
+            data={"method": method, "ok": ok, "seconds": round(seconds, 1), "error": error},
+        )
+    )
+
+
+def _connect_robot(settings: Settings, target: Cluster) -> dict[str, Any]:
+    """Open (or reuse) the automation-node connection. Raises with a clear message on failure."""
+    if not _robot_configured(settings, target):
+        raise RuntimeError(f"No automation node is enabled for {target.name} (robot_enabled / robot_host).")
+    key = _robot_key(target)
+    if _robot_alive(target):
+        return {"connected": True, "reused": True}
+    failed = _robot_failures.get(target.name)
+    if failed and time.time() - failed[0] < _ROBOT_RETRY_AFTER:
+        raise RuntimeError(
+            f"The automation node for {target.name} failed {int(time.time() - failed[0])}s ago ({failed[1]}); "
+            f"not retrying for {_ROBOT_RETRY_AFTER // 60} minutes to avoid being locked out. Use cluster_login."
+        )
+    start = time.time()
+    user = target.robot_user or target.user
+    if not user:
+        raise RuntimeError(f"Set user (or robot_user) for {target.name} to use its automation node.")
+    known_hosts = tuple(
+        Path(path).expanduser()
+        for path in (settings.known_hosts or "~/.ssh/known_hosts", settings.robot_known_hosts)
+    )
+    try:
+        result = get_backend().login_robot(  # type: ignore[attr-defined]
+            key,
+            hostname=str(target.robot_host),
+            user=user,
+            identity=Path(settings.robot_identity).expanduser(),
+            known_hosts=known_hosts,
+            ip_version=settings.robot_ip_version,
+        )
+    except Exception as exc:
+        _robot_failures[target.name] = (time.time(), str(exc))
+        _record_connection(target, "robot", False, time.time() - start, str(exc))
+        _write_remote_audit(settings, {"tool": "robot_login", "cluster": target.name, "host": target.robot_host,
+                                       "exception": repr(exc)})
+        raise
+    _robot_failures.pop(target.name, None)
+    if not result.get("reused"):
+        _record_connection(target, "robot", True, time.time() - start)
+        _write_remote_audit(settings, {"tool": "robot_login", "cluster": target.name, "host": target.robot_host,
+                                       "connected": True})
+    return result
+
+
+def _route(settings: Settings, target: Cluster) -> str:
+    """'login' when the interactive connection is up, else 'robot' when an automation node is enabled."""
+    if _login_alive(target):
+        return "login"
+    if _robot_configured(settings, target):
+        _connect_robot(settings, target)
+        return "robot"
+    return "login"  # the backend raises its usual "Not connected ... call cluster_login" error
+
+
+def _run_on_robot(
+    target: Cluster,
+    argv: list[str],
+    *,
+    tool: str,
+    timeout: int,
+    cwd: str | None,
+    input_data: bytes | None,
+) -> CommandResult:
+    needs_login = (
+        f"{tool} needs the interactive login on {target.name}: the automation node only runs single Slurm, git, "
+        "file, and transfer commands (no shell). Call cluster_login and approve the Duo push."
+    )
+    if cwd is not None or input_data is not None:
+        raise RuntimeError(needs_login)
+    try:
+        command = robot.command_string(argv)
+    except robot.RobotCommandError as exc:
+        raise RuntimeError(f"{needs_login} ({exc})") from exc
+    result = get_backend().run_raw(_robot_key(target), command, timeout=timeout)  # type: ignore[attr-defined]
+    if robot.was_rejected(result.stdout):
+        raise RuntimeError(f"{needs_login} (the automation node rejected: {result.stdout.strip()[:200]})")
+    return result
+
+
+def _robot_sftp(settings: Settings, target: Cluster, tool: str, action: Callable[[Any], Any], detail: str) -> Any:
+    """Run an SFTP action over the automation-node connection, with an audit entry."""
+    event = {"tool": tool, "cluster": target.name, "host": target.robot_host, "via": "robot-sftp", "op": detail}
+    client = get_backend().sftp(_robot_key(target))  # type: ignore[attr-defined]
+    try:
+        value = action(client)
+    except Exception as exc:
+        _write_remote_audit(settings, {**event, "exception": repr(exc)})
+        raise
+    finally:
+        client.close()
+    _write_remote_audit(settings, {**event, "ok": True})
+    return value
+
+
+def _sftp_kind(client: Any, path: str) -> str | None:
+    try:
+        mode = client.stat(path).st_mode
+    except OSError:
+        return None
+    if stat_module.S_ISDIR(mode):
+        return "dir"
+    if stat_module.S_ISREG(mode):
+        return "file"
+    return "other"
+
+
+def _sftp_head(client: Any, path: str, max_bytes: int) -> tuple[str, int]:
+    size = client.stat(path).st_size or 0
+    with client.open(path, "rb") as handle:
+        data = handle.read(max_bytes)
+    return data.decode("utf-8", "replace"), size
+
+
+def _sftp_tail(client: Any, path: str, lines: int) -> str:
+    size = client.stat(path).st_size or 0
+    chunk = 64 * 1024
+    with client.open(path, "rb") as handle:
+        data = b""
+        while True:
+            start = max(0, size - chunk)
+            handle.seek(start)
+            data = handle.read(size - start)
+            if start == 0 or data.count(b"\n") > lines:
+                break
+            chunk *= 4
+    text = data.decode("utf-8", "replace")
+    kept = text.splitlines(keepends=True)[-lines:]
+    return "".join(kept)
+
+
+def _sftp_walk(client: Any, root: str, max_depth: int, scan_limit: int = 20000) -> list[tuple[str, int, float]]:
+    """Regular files under root (depth-limited, like find -maxdepth): (path, size, mtime)."""
+    found: list[tuple[str, int, float]] = []
+    pending = [(root.rstrip("/") or "/", 0)]
+    scanned = 0
+    while pending and scanned < scan_limit:
+        directory, depth = pending.pop()
+        try:
+            entries = client.listdir_attr(directory)
+        except OSError:
+            continue
+        for entry in entries:
+            scanned += 1
+            path = f"{directory}/{entry.filename}"
+            if stat_module.S_ISDIR(entry.st_mode or 0):
+                if depth + 1 < max_depth:
+                    pending.append((path, depth + 1))
+            elif stat_module.S_ISREG(entry.st_mode or 0):
+                found.append((path, entry.st_size or 0, float(entry.st_mtime or 0)))
+    return found
+
+
+def _sftp_makedirs(client: Any, path: str) -> None:
+    parts = [part for part in path.split("/") if part]
+    current = ""
+    for part in parts:
+        current += "/" + part
+        if _sftp_kind(client, current) is None:
+            client.mkdir(current)
+
+
+def _listing(files: list[tuple[str, int, float]], roots: dict[str, str], limit: int) -> list[dict[str, Any]]:
+    entries = []
+    for path, size, mtime in sorted(files, key=lambda item: item[2], reverse=True)[:limit]:
+        resolved = resolve_remote_path(path, roots, label="path")
+        entries.append({"path": path, "root": resolved.root_name, "relative_path": resolved.relative,
+                        "size_bytes": size, "modified_epoch": f"{mtime:.10f}"})
+    return entries
+
+
+def _remote_file_info(settings: Settings, target: Cluster, path: str, tool: str) -> tuple[str | None, int | None]:
+    """(kind, size): kind is 'file', 'dir', another type, or None if missing."""
+    if _route(settings, target) == "robot":
+
+        def info(client: Any) -> tuple[str | None, int | None]:
+            kind = _sftp_kind(client, path)
+            return kind, (client.stat(path).st_size if kind == "file" else None)
+
+        return _robot_sftp(settings, target, tool, info, f"stat {path}")
+    result = _run_remote_result(settings, target, stat_file_argv(path), tool=tool, timeout=15)
+    if result.returncode != 0:
+        return None, None
+    metadata = parse_stat_output(result.stdout)
+    file_type = metadata.get("file_type")
+    kind = "file" if file_type in {"regular file", "regular empty file"} else ("dir" if file_type == "directory" else file_type)
+    size = metadata.get("size_bytes")
+    return kind, size if isinstance(size, int) else None
+
+
+def _tail(settings: Settings, target: Cluster, path: str, lines: int, tool: str) -> str:
+    if _route(settings, target) == "robot":
+        return _robot_sftp(settings, target, tool, lambda client: _sftp_tail(client, path, lines), f"tail {path}")
+    return _run_remote_output(settings, target, tail_file_argv(path, lines), tool=tool, timeout=30, strip=False)
+
+
+def _transfer_host(settings: Settings, target: Cluster) -> str:
+    """Connection to use for SFTP uploads/downloads: the login node, or the automation node."""
+    return _robot_key(target) if _route(settings, target) == "robot" else target.host
 
 
 def _write_remote_audit(settings: Settings, event: dict[str, Any]) -> None:

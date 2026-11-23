@@ -322,6 +322,62 @@ off unless `allow_remote_shell: true`. When it's on:
   dangerous: whatever a mistaken or prompt-injected agent decides to run then
   runs under your account. It's off by default.
 
+## Automation nodes (optional, needs approval)
+
+Some clusters have an **automation node** that accepts a constrained SSH key
+without Duo
+([Alliance docs](https://docs.alliancecan.ca/wiki/Automation_in_the_context_of_multifactor_authentication)).
+Alliance grants access **by request**, and states that these nodes "are not
+suitable for usage of AI agents". Ask support before turning this on.
+
+How the server uses them:
+
+- **When.** If the cluster's login connection is up, everything uses it.
+  Otherwise, with `robot_enabled: true` and a `robot_host` for the cluster,
+  tools connect to the automation node on their own, without a Duo push.
+- **Which tools.** Commands that the node's wrapper (`allowed_commands.sh`)
+  accepts go there: Slurm (`squeue`, `sacct`, `sbatch`, `scancel`, `sinfo`),
+  git status, fetch, pull and checkout, and file reads, writes, listings and
+  transfers over SFTP. The wrapper runs commands without a shell, so the
+  server sends them as single commands. `submit_job` uses `--chdir` and an
+  absolute script path, and file tools use SFTP instead of
+  `find`/`stat`/`tail`.
+- **What still needs the login node.** Anything needing a shell: the
+  `run_remote_command` tool, `grep_files`, venv builds, HF downloads, directory
+  transfers, `sync_local_commits`, `slurm_accounts` and preflight. These say
+  so and ask for `cluster_login`. The wrapper reports rejected commands with
+  exit code 0, so the server detects its rejection message instead.
+- **Logging in.** `cluster_login(method=...)` takes `"login"` (Duo), `"robot"`
+  (key only) or `"auto"`. With `auto`, the server tries Duo first, and if the
+  push isn't approved in time and `robot_fallback_on_mfa_timeout: true`, it
+  connects the automation node instead.
+- **History.** `cluster_auth_status` shows both connections and the recent
+  login history per method. Connection attempts are recorded as `connection`
+  events. A failed automation login isn't retried for 10 minutes, since
+  clusters throttle repeated logins.
+
+Setup:
+
+1. Create a dedicated key without a passphrase. Unattended use can't type
+   one, which is why the CCDB line pins it to your IP:
+   `ssh-keygen -t ed25519 -N "" -f ~/.ssh/alliance_robot_ed25519`.
+2. Add it in CCDB with all three constraints, for example:
+   `restrict,from="x.y.z.*",command="/cvmfs/soft.computecanada.ca/custom/bin/computecanada/allowed_commands/allowed_commands.sh" ssh-ed25519 AAAA...`.
+   `from=` must be your public IP with at least the first three parts fixed.
+   Set `robot_ip_version` to match the address family the mask uses.
+3. Record the nodes' host keys in a separate file with `ssh-keyscan -4
+   <robot host> >> ~/.ssh/known_hosts_alliance_robots`. Check the
+   fingerprints first.
+4. Set `robot_host` per cluster. The documented nodes are:
+   - `robot.fir.alliancecan.ca`, `robot.narval.alliancecan.ca`,
+     `robot.nibi.alliancecan.ca` and `robot.rorqual.alliancecan.ca`;
+   - `robot.tamia.ecpia.ca`;
+   - `robot2.scinet.utoronto.ca` for Trillium, and
+     `trig-robot1.scinet.utoronto.ca` for Trillium GPU.
+
+   Then set `robot_enabled: true`, and optionally
+   `robot_fallback_on_mfa_timeout: true`.
+
 ## Job submission details
 
 Profiles in `config.yaml` set `sbatch` options: `time`, `mem`,

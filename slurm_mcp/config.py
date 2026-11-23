@@ -97,6 +97,9 @@ class Cluster:
     slurm: dict[str, Any] | None = None
     storage: dict[str, str] | None = None
     python: dict[str, Any] | None = None
+    # Alliance automation node for unattended access (no MFA, constrained key), e.g. robot.narval.alliancecan.ca.
+    robot_host: str | None = None
+    robot_user: str | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +126,14 @@ class Settings:
     remote_shell_auto_approve_readonly: bool = True
     # Extra command names the user trusts as read-only (any arguments).
     remote_shell_readonly_commands: tuple[str, ...] = ()
+    # Automation nodes. robot_enabled is the master switch (off until Alliance approves access);
+    # robot_fallback_on_mfa_timeout also uses the node when a Duo push is not approved in time.
+    robot_enabled: bool = False
+    robot_fallback_on_mfa_timeout: bool = False
+    robot_identity: str = "~/.ssh/alliance_robot_ed25519"
+    robot_known_hosts: str = "~/.ssh/known_hosts_alliance_robots"
+    # 4 or 6 to force the address family that matches the key's from= mask; None lets the OS choose.
+    robot_ip_version: int | None = None
     max_transfer_bytes: int = 200_000_000
     # Local directories that upload/download/sync tools may touch. Empty means the
     # server's working directory at startup.
@@ -280,11 +291,12 @@ _TOP_LEVEL_KEYS = frozenset(
         "default_cluster", "clusters", "ssh_command", "cluster_defaults", "profiles", "audit_log", "state_db",
         "ssh_backend", "ssh_config", "known_hosts", "duo_option", "keepalive_seconds", "allow_remote_shell",
         "remote_shell_auto_approve", "remote_shell_auto_approve_readonly", "remote_shell_readonly_commands",
-        "max_transfer_bytes", "local_roots", "projects", "default_project",
+        "max_transfer_bytes", "robot_enabled", "robot_fallback_on_mfa_timeout", "robot_identity",
+        "robot_known_hosts", "robot_ip_version", "local_roots", "projects", "default_project",
     }
 )
 _SECTION_KEYS = frozenset({"docs", "policies", "setup_hints", "slurm", "storage", "python"})
-_CLUSTER_KEYS = _SECTION_KEYS | {"host", "user", "remote_repo", "run_root"}
+_CLUSTER_KEYS = _SECTION_KEYS | {"host", "user", "remote_repo", "run_root", "robot_host", "robot_user"}
 _SLURM_KEYS = frozenset(
     {
         "submit_command", "status_command", "accounting_command", "gpu_request_style", "default_account",
@@ -354,6 +366,8 @@ def load_settings(path: str | Path) -> Settings:
             slurm=_plain_mapping(value, "slurm"),
             storage=storage,
             python=_plain_mapping(value, "python"),
+            robot_host=_optional_string(value, "robot_host"),
+            robot_user=_optional_string(value, "robot_user"),
         )
 
     default_cluster = raw.get("default_cluster") or next(iter(clusters))
@@ -382,11 +396,25 @@ def load_settings(path: str | Path) -> Settings:
         remote_shell_auto_approve=_bool(raw, "remote_shell_auto_approve", False),
         remote_shell_auto_approve_readonly=_bool(raw, "remote_shell_auto_approve_readonly", True),
         remote_shell_readonly_commands=_command_names(raw, "remote_shell_readonly_commands"),
+        robot_enabled=_bool(raw, "robot_enabled", False),
+        robot_fallback_on_mfa_timeout=_bool(raw, "robot_fallback_on_mfa_timeout", False),
+        robot_identity=_optional_string(raw, "robot_identity") or "~/.ssh/alliance_robot_ed25519",
+        robot_known_hosts=_optional_string(raw, "robot_known_hosts") or "~/.ssh/known_hosts_alliance_robots",
+        robot_ip_version=_ip_version(raw),
         max_transfer_bytes=_positive_int(raw, "max_transfer_bytes", 200_000_000),
         local_roots=_string_tuple(raw, "local_roots"),
         projects=_projects(raw.get("projects"), clusters),
         default_project=default_project,
     )
+
+
+def _ip_version(mapping: dict[str, Any]) -> int | None:
+    value = mapping.get("robot_ip_version")
+    if value is None:
+        return None
+    if value not in (4, 6):
+        raise ValueError("'robot_ip_version' must be 4, 6, or null.")
+    return int(value)
 
 
 def _command_names(mapping: dict[str, Any], key: str) -> tuple[str, ...]:

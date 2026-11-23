@@ -30,6 +30,18 @@ state_db: .slurm-mcp-state.sqlite3
 # local_roots:
 #   - D:/Projects/my-paper
 
+# Alliance automation ("robot") nodes: no Duo, but only simple Slurm/git/file/transfer
+# commands, with a constrained key registered in CCDB. Access is by request, and Alliance
+# says these nodes are "not suitable for usage of AI agents"; ask support before enabling.
+# Set robot_host per cluster (e.g. robot.narval.alliancecan.ca). See README "Automation nodes".
+robot_enabled: false
+# Also use the automation node when a Duo push is not approved in time (cluster_login auto).
+robot_fallback_on_mfa_timeout: false
+robot_identity: ~/.ssh/alliance_robot_ed25519
+robot_known_hosts: ~/.ssh/known_hosts_alliance_robots
+# 4 or 6 to match the address family of the key's from= mask (Windows often prefers IPv6).
+robot_ip_version: null
+
 # Cap per transfer: files, directory archives, cluster-to-cluster relays, and git bundles.
 # Relays go through this machine; for big datasets use Globus instead of raising this a lot.
 max_transfer_bytes: 200000000

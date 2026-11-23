@@ -185,6 +185,75 @@ class ParamikoBackend:
                 )
             return result
 
+    def login_robot(
+        self,
+        key: str,
+        *,
+        hostname: str,
+        user: str,
+        identity: Path,
+        known_hosts: tuple[Path, ...],
+        ip_version: int | None = None,
+        port: int = 22,
+    ) -> dict[str, Any]:
+        """Connect to an Alliance automation node with a constrained key: no MFA, publickey only.
+
+        The connection is stored under `key` (e.g. "robot:narval") so it can sit
+        next to the interactive login connection for the same cluster.
+        """
+        with self._host_lock(key):
+            existing = self._connections.get(key)
+            if existing is not None and existing.alive:
+                return {"connected": True, "reused": True, "message": self.check(key).stdout}
+            if existing is not None:
+                self._close(key)
+            if not identity.is_file():
+                raise RuntimeError(f"Automation key not found: {identity}")
+            try:
+                pkey = paramiko.PKey.from_path(str(identity))
+            except paramiko.PasswordRequiredException as exc:
+                raise RuntimeError(f"{identity} is passphrase-protected; automation keys must not be.") from exc
+            transport = self._connect_transport(hostname, port, known_hosts, ip_version)
+            try:
+                transport.auth_timeout = self.connect_timeout
+                try:
+                    transport.auth_publickey(user, pkey)
+                except paramiko.AuthenticationException as exc:
+                    raise RuntimeError(
+                        f"The automation node refused the key ({exc}). Check that the key is in CCDB with "
+                        "restrict,from=...,command=... options, that your current public IP matches from=, "
+                        "and that Alliance has enabled automation access for your account."
+                    ) from exc
+                if not transport.is_authenticated():
+                    raise RuntimeError("The automation node asked for more than a key (MFA); it is not usable here.")
+            except Exception:
+                transport.close()
+                raise
+            transport.set_keepalive(self.keepalive_seconds)
+            peer = transport.getpeername()[0] if transport.sock else None
+            self._connections[key] = _Connection(transport=transport, hostname=hostname, user=user, port=port)
+            return {"connected": True, "reused": False, "message": f"Authenticated as {user}@{hostname} (automation node).",
+                    "peer_address": peer}
+
+    def run_raw(self, host: str, command: str, *, timeout: int = 60) -> CommandResult:
+        """Run a command string exactly as given (no shell quoting), for forced-command wrappers."""
+        transport = self._transport(host)
+        channel = transport.open_session(timeout=self.connect_timeout)
+        try:
+            channel.exec_command(command)
+            channel.shutdown_write()
+            return _collect(channel, timeout)
+        finally:
+            channel.close()
+
+    def sftp(self, host: str) -> paramiko.SFTPClient:
+        """An SFTP session over an existing connection; the caller closes it."""
+        client = paramiko.SFTPClient.from_transport(self._transport(host))
+        if client is None:
+            raise RuntimeError("Could not open SFTP session.")
+        client.get_channel().settimeout(600)
+        return client
+
     def logout(self, host: str) -> dict[str, Any]:
         with self._host_lock(host):
             existed = host in self._connections
@@ -257,16 +326,34 @@ class ParamikoBackend:
             conn.transport.close()
 
     def _open_transport(self, settings: HostSettings) -> paramiko.Transport:
-        host_keys, self.known_hosts_skipped = load_known_hosts(self.known_hosts_path)
-        lookup_name = settings.hostname if settings.port == 22 else f"[{settings.hostname}]:{settings.port}"
+        return self._connect_transport(settings.hostname, settings.port, (self.known_hosts_path,), None, settings.alias)
+
+    def _connect_transport(
+        self,
+        hostname: str,
+        port: int,
+        known_hosts_files: tuple[Path, ...],
+        ip_version: int | None,
+        alias: str | None = None,
+    ) -> paramiko.Transport:
+        host_keys = paramiko.HostKeys()
+        self.known_hosts_skipped = []
+        for path in known_hosts_files:
+            keys, skipped = load_known_hosts(path)
+            if path == self.known_hosts_path:
+                self.known_hosts_skipped = skipped
+            for name in keys.keys():
+                for key_type, key in keys[name].items():
+                    host_keys.add(name, key_type, key)
+        lookup_name = hostname if port == 22 else f"[{hostname}]:{port}"
         known = host_keys.lookup(lookup_name)
         if not known:
             raise RuntimeError(
-                f"No known_hosts entry for {lookup_name}. Run 'ssh {settings.alias}' once in a terminal "
+                f"No known_hosts entry for {lookup_name}. Run 'ssh {alias or hostname}' once in a terminal "
                 "to verify and record the host key, then retry."
             )
 
-        sock = socket.create_connection((settings.hostname, settings.port), timeout=self.connect_timeout)
+        sock = _open_socket(hostname, port, self.connect_timeout, ip_version)
         transport = paramiko.Transport(sock)
         options = transport.get_security_options()
         preferred = [name for name in options.key_types if name in known]
@@ -329,6 +416,24 @@ class ParamikoBackend:
         transport.auth_interactive(settings.user, handler)
         if not transport.is_authenticated():
             raise RuntimeError("Multifactor authentication was not completed.")
+
+
+def _open_socket(hostname: str, port: int, timeout: float, ip_version: int | None) -> socket.socket:
+    """TCP connection, optionally forced to IPv4 or IPv6 (automation keys pin one address family)."""
+    if ip_version is None:
+        return socket.create_connection((hostname, port), timeout=timeout)
+    family = socket.AF_INET if ip_version == 4 else socket.AF_INET6
+    errors: list[str] = []
+    for af, kind, proto, _, address in socket.getaddrinfo(hostname, port, family, socket.SOCK_STREAM):
+        sock = socket.socket(af, kind, proto)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(address)
+            return sock
+        except OSError as exc:
+            errors.append(str(exc))
+            sock.close()
+    raise OSError(f"Could not connect to {hostname} over IPv{ip_version}: {'; '.join(errors) or 'no address'}")
 
 
 def _candidate_keys(identity_files: tuple[Path, ...], errors: list[str]):
