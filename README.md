@@ -325,6 +325,60 @@ off unless `allow_remote_shell: true`. When it's on:
   dangerous: whatever a mistaken or prompt-injected agent decides to run then
   runs under your account. It's off by default.
 
+## Shared server: one Duo approval per cluster for every client
+
+By default each client (every Claude Code session, Codex) starts its own copy
+of the server, so each one holds its own SSH connections and needs its own
+Duo push. Instead, run **one shared server** that all clients connect to over
+HTTP on your machine.
+
+```powershell
+.\scripts\shared-server.ps1                 # start in the background (logs: ~/.slurm-mcp/server.err.log)
+.\scripts\shared-server.ps1 -Status         # or -Stop
+.\scripts\register-autostart.ps1            # optional: start it at each Windows logon
+```
+
+On first start it creates a random token in `~/.slurm-mcp/server-token`, and
+every request must send it. Connect the clients:
+
+```bash
+# Claude Code (replaces the stdio registration; remove that one first)
+claude mcp remove alliance-slurm
+claude mcp add --scope user --transport http alliance-slurm http://127.0.0.1:8765/mcp \
+  --header "Authorization: Bearer $(cat ~/.slurm-mcp/server-token)"
+```
+
+```toml
+# Codex: ~/.codex/config.toml (set SLURM_MCP_TOKEN to the token, e.g. with setx)
+[mcp_servers.alliance-slurm]
+url = "http://127.0.0.1:8765/mcp"
+bearer_token_env_var = "SLURM_MCP_TOKEN"
+tool_timeout_sec = 900   # cluster_login waits up to 2 minutes for Duo
+```
+
+**When Duo happens.** Once per cluster, the first time any client needs it.
+After that, every session and agent reuses the connection, and `/mcp` in
+Claude Code only reconnects the client, without a new push. A new push is
+needed only when the shared server restarts (reboot, or loading new server
+code) or when a connection breaks (laptop sleep, network drop, login node
+reboot). Then one client logs in again for everyone.
+
+**What's shared:**
+
+- **Shared by all clients:** SSH connections, the project record, cluster
+  notes, and the login history.
+- **Per client session:** the active project (`project_use`), and approval
+  dialogs for shell commands, which appear in the session that ran the
+  command.
+
+Slow calls, like a Duo wait or a transfer, run in worker threads, so they
+don't block other clients.
+
+**Security.** The server only listens on loopback (`--host` refuses anything
+else), and requests without the token get 401. Anything running as you that
+can read the token file can use your open cluster connections, much as
+anything running as you could use your SSH key.
+
 ## Automation nodes (optional, needs approval)
 
 Some clusters have an **automation node** that accepts a constrained SSH key

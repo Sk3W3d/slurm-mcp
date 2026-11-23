@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import functools
+import hmac
+import inspect
 import json
 import os
+import secrets
 import shlex
 import sqlite3
 import stat as stat_module
+import sys
 import tempfile
 import time
+import weakref
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
@@ -157,9 +163,34 @@ mcp = FastMCP("alliance-slurm", instructions=SERVER_INSTRUCTIONS)
 settings: Settings | None = None
 backend: SSHBackend | None = None
 
+
+def tool(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Register fn as an MCP tool and return it unchanged.
+
+    Plain (blocking) functions are registered through an async wrapper that
+    runs them in a worker thread. With one server shared by several clients,
+    a slow call (a Duo wait, a large transfer) then no longer stalls everyone
+    else. The module-level function stays synchronous for internal callers
+    and tests; the request context still reaches the thread.
+    """
+    if inspect.iscoroutinefunction(fn):
+        mcp.tool()(fn)
+        return fn
+
+    @functools.wraps(fn)
+    async def threaded(*args: Any, **kwargs: Any) -> Any:
+        return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+
+    mcp.tool()(threaded)
+    return fn
+
+
 _UNSET = object()
-# Project selected with project_use. _UNSET means "use settings.default_project".
+# Project selected with project_use when there is no client session (tests, direct calls).
+# _UNSET means "use settings.default_project".
 active_project: Any = _UNSET
+# Per client session when serving several clients: each session's project_use is its own.
+_session_projects: "weakref.WeakKeyDictionary[Any, Any]" = weakref.WeakKeyDictionary()
 
 
 def get_settings() -> Settings:
@@ -168,10 +199,29 @@ def get_settings() -> Settings:
     return settings
 
 
+def _client_session() -> Any:
+    """The MCP session of the client making the current call, or None outside a request."""
+    try:
+        return mcp.get_context().session
+    except Exception:
+        return None
+
+
 def get_active_project() -> str | None:
-    if active_project is _UNSET:
+    session = _client_session()
+    value = _session_projects.get(session, _UNSET) if session is not None else active_project
+    if value is _UNSET:
         return get_settings().default_project
-    return active_project
+    return value
+
+
+def _set_active_project(name: str | None) -> None:
+    global active_project
+    session = _client_session()
+    if session is None:
+        active_project = name
+    else:
+        _session_projects[session] = name
 
 
 _ledger_cache: tuple[Settings, Ledger | None] | None = None
@@ -232,13 +282,13 @@ def make_backend(current_settings: Settings) -> SSHBackend:
     )
 
 
-@mcp.tool()
+@tool
 def list_clusters() -> list[str]:
     """List configured cluster names."""
     return sorted(get_settings().clusters)
 
 
-@mcp.tool()
+@tool
 def cluster_info(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Return structured cluster configuration, policies, and setup hints.
 
@@ -269,17 +319,17 @@ def _project_paths(settings: Settings, project: str | None) -> dict[str, dict[st
     return paths
 
 
-@mcp.tool()
+@tool
 def project_use(project: str | None = None) -> dict[str, object]:
     """Select the active project; tools without an explicit project= argument use it.
 
     Any valid name works; it does not need to be listed under 'projects' in the
     config. Paths are built from the storage templates (for example
     remote_repo: /scratch/{user}/projects/{project}). Pass null to clear it.
-    The selection lasts until the MCP server restarts, then default_project
-    applies again. Returns where the project lives on each cluster.
+    The selection belongs to this client session (other sessions sharing the
+    server keep their own) and lasts until the session ends, then
+    default_project applies again. Returns where the project lives on each cluster.
     """
-    global active_project
     current_settings = get_settings()
     name = validate_project_name(project) if project else None
     if name is not None and not any(
@@ -289,7 +339,7 @@ def project_use(project: str | None = None) -> dict[str, object]:
             f"Project '{name}' would not change any path: no cluster storage uses {{project}} and the project has "
             "no storage overrides. Add {project} to the storage templates in config.yaml."
         )
-    active_project = name
+    _set_active_project(name)
     spec = current_settings.projects.get(name) if name else None
     return {
         "active_project": name,
@@ -299,7 +349,7 @@ def project_use(project: str | None = None) -> dict[str, object]:
     }
 
 
-@mcp.tool()
+@tool
 def project_list(cluster: str | None = None) -> dict[str, object]:
     """List projects: the active one, those configured in config.yaml, and (with cluster) those found on it.
 
@@ -423,7 +473,7 @@ def _refresh_cluster(settings: Settings, ledger: Ledger, target: Cluster, projec
 _TASK_VIEW_FIELDS = ("task_id", "kind", "description", "started_at", "state", "exit_code", "state_checked_at")
 
 
-@mcp.tool()
+@tool
 def project_status(
     project: str | None = None,
     cluster: str | None = None,
@@ -490,7 +540,7 @@ def project_status(
     return result
 
 
-@mcp.tool()
+@tool
 def project_history(
     project: str | None = None,
     cluster: str | None = None,
@@ -525,7 +575,7 @@ def _client_name(ctx: Context | None) -> str | None:
         return None
 
 
-@mcp.tool()
+@tool
 def project_note(
     text: str,
     project: str | None = None,
@@ -605,7 +655,7 @@ _ATOMIC_WRITE_SCRIPT = (
 )
 
 
-@mcp.tool()
+@tool
 def project_record_sync(project: str | None = None, cluster: str | None = None) -> dict[str, object]:
     """Merge this machine's record of a project with the copy on a cluster, then update that copy.
 
@@ -727,7 +777,7 @@ def _cluster_notes_for(clusters: list[str] | None) -> list[dict[str, Any]]:
     ]
 
 
-@mcp.tool()
+@tool
 def cluster_note(
     text: str,
     cluster: str | None = None,
@@ -760,7 +810,7 @@ def cluster_note(
             "text": note, **({"replaced": replaces} if replaces else {})}
 
 
-@mcp.tool()
+@tool
 def cluster_note_remove(note_id: str) -> dict[str, object]:
     """Remove an outdated cluster note (it stays in the record as removed, so syncing does not bring it back)."""
     if not _require_ledger().remove_cluster_note(note_id):
@@ -768,7 +818,7 @@ def cluster_note_remove(note_id: str) -> dict[str, object]:
     return {"removed": True, "note_id": note_id}
 
 
-@mcp.tool()
+@tool
 def cluster_notes(cluster: str | None = None, category: str | None = None) -> dict[str, object]:
     """List cluster notes: general ones (such as which cluster to prefer) plus notes for one cluster or all.
 
@@ -782,7 +832,7 @@ def cluster_notes(cluster: str | None = None, category: str | None = None) -> di
     return {"cluster": cluster or "all", "count": len(notes), "notes": [_cluster_note_view(note) for note in notes]}
 
 
-@mcp.tool()
+@tool
 def cluster_overview(
     cluster: str | None = None,
     refresh: bool = True,
@@ -859,7 +909,7 @@ def _project_workspace(settings: Settings, target: Cluster) -> str | None:
     return normalize_remote_root(repo[: -len(suffix)], "workspace")
 
 
-@mcp.tool()
+@tool
 def cluster_docs(cluster: str | None = None) -> list[dict[str, object]]:
     """Return configured documentation sources for a cluster.
 
@@ -890,7 +940,7 @@ def cluster_docs(cluster: str | None = None) -> list[dict[str, object]]:
     return docs
 
 
-@mcp.tool()
+@tool
 def cluster_auth_status(cluster: str | None = None) -> dict[str, object]:
     """Connection state for a cluster: the interactive login, the automation node, and recent history.
 
@@ -944,7 +994,7 @@ ROBOT_CAPABLE = frozenset(
 _LOGIN_METHODS = ("auto", "login", "robot")
 
 
-@mcp.tool()
+@tool
 async def cluster_login(
     cluster: str | None = None,
     passcode: str | None = None,
@@ -1001,7 +1051,7 @@ async def cluster_login(
     return {"cluster": target.name, "host": target.host, "backend": get_backend().name, "via": "login", **result}
 
 
-@mcp.tool()
+@tool
 def cluster_logout(cluster: str | None = None) -> dict[str, object]:
     """Close the SSH connection to a cluster."""
     current_settings = get_settings()
@@ -1011,7 +1061,7 @@ def cluster_logout(cluster: str | None = None) -> dict[str, object]:
     return {"cluster": target.name, "host": target.host, **result}
 
 
-@mcp.tool()
+@tool
 def remote_whoami(cluster: str | None = None) -> dict[str, str]:
     """Run a non-interactive whoami through the existing SSH connection."""
     current_settings = get_settings()
@@ -1029,7 +1079,7 @@ def remote_whoami(cluster: str | None = None) -> dict[str, str]:
     }
 
 
-@mcp.tool()
+@tool
 def list_job_profiles(cluster: str | None = None) -> dict[str, object]:
     """List configured Slurm job profiles and relevant cluster submission metadata."""
     current_settings = get_settings()
@@ -1043,7 +1093,7 @@ def list_job_profiles(cluster: str | None = None) -> dict[str, object]:
     }
 
 
-@mcp.tool()
+@tool
 def list_jobs(cluster: str | None = None, states: str | None = None) -> dict[str, object]:
     """List current Slurm jobs for the remote user as structured records."""
     current_settings = get_settings()
@@ -1070,7 +1120,7 @@ def list_jobs(cluster: str | None = None, states: str | None = None) -> dict[str
     }
 
 
-@mcp.tool()
+@tool
 def job_status(job_id: str, cluster: str | None = None) -> dict[str, object]:
     """Read live queue and accounting information for one Slurm job."""
     current_settings = get_settings()
@@ -1122,7 +1172,7 @@ def job_status(job_id: str, cluster: str | None = None) -> dict[str, object]:
     }
 
 
-@mcp.tool()
+@tool
 def submit_job(
     profile: str,
     script: str,
@@ -1292,7 +1342,7 @@ def submit_job(
     }
 
 
-@mcp.tool()
+@tool
 def cancel_job(job_id: str, cluster: str | None = None) -> dict[str, object]:
     """Cancel one of your own Slurm jobs (scancel --user=<you>)."""
     current_settings = get_settings()
@@ -1330,7 +1380,7 @@ def cancel_job(job_id: str, cluster: str | None = None) -> dict[str, object]:
     }
 
 
-@mcp.tool()
+@tool
 def job_history(cluster: str | None = None, days: int = 7, limit: int = 100) -> dict[str, object]:
     """List your recent jobs from Slurm accounting (sacct), newest first."""
     current_settings = get_settings()
@@ -1362,7 +1412,7 @@ def job_history(cluster: str | None = None, days: int = 7, limit: int = 100) -> 
     }
 
 
-@mcp.tool()
+@tool
 def cluster_partitions(cluster: str | None = None) -> dict[str, object]:
     """Summarize Slurm partitions, node states, CPUs, memory, and GPUs (sinfo)."""
     current_settings = get_settings()
@@ -1372,7 +1422,7 @@ def cluster_partitions(cluster: str | None = None) -> dict[str, object]:
     return {"cluster": target.name, "host": target.host, "count": len(rows), "partitions": rows}
 
 
-@mcp.tool()
+@tool
 def slurm_accounts(cluster: str | None = None) -> dict[str, object]:
     """List the allocation accounts you can submit with (e.g. def-pi) and fair-share usage."""
     current_settings = get_settings()
@@ -1409,7 +1459,7 @@ def slurm_accounts(cluster: str | None = None) -> dict[str, object]:
     }
 
 
-@mcp.tool()
+@tool
 def disk_quota(cluster: str | None = None) -> dict[str, object]:
     """Space and file-count quotas for home, scratch, and project folders (Alliance diskusage_report).
 
@@ -1435,7 +1485,7 @@ def disk_quota(cluster: str | None = None) -> dict[str, object]:
     }
 
 
-@mcp.tool()
+@tool
 def list_run_files(
     cluster: str | None = None,
     path: str | None = None,
@@ -1478,7 +1528,7 @@ def list_run_files(
     }
 
 
-@mcp.tool()
+@tool
 def read_file(
     path: str,
     cluster: str | None = None,
@@ -1529,7 +1579,7 @@ def read_file(
     }
 
 
-@mcp.tool()
+@tool
 def tail_file(
     path: str,
     cluster: str | None = None,
@@ -1555,7 +1605,7 @@ def tail_file(
     }
 
 
-@mcp.tool()
+@tool
 def grep_files(
     pattern: str,
     path: str | None = None,
@@ -1592,7 +1642,7 @@ def grep_files(
     }
 
 
-@mcp.tool()
+@tool
 def job_logs(
     job_id: str,
     cluster: str | None = None,
@@ -1619,7 +1669,7 @@ def job_logs(
     }
 
 
-@mcp.tool()
+@tool
 def tail_job_log(
     job_id: str,
     stream: str = "stdout",
@@ -1652,7 +1702,7 @@ def tail_job_log(
 _WRITE_FILE_MAX_BYTES = 1_000_000
 
 
-@mcp.tool()
+@tool
 def write_file(
     path: str,
     content: str,
@@ -1710,7 +1760,7 @@ def write_file(
     }
 
 
-@mcp.tool()
+@tool
 def upload_file(
     local_path: str,
     remote_path: str,
@@ -1769,7 +1819,7 @@ def upload_file(
     }
 
 
-@mcp.tool()
+@tool
 def download_file(
     remote_path: str,
     local_path: str | None = None,
@@ -1946,7 +1996,7 @@ def _pull_archive(
         _run_remote_result(settings, target, ["rm", "-f", "--", remote_archive], tool=tool, timeout=30)
 
 
-@mcp.tool()
+@tool
 def upload_directory(
     local_dir: str,
     remote_dir: str,
@@ -2014,7 +2064,7 @@ def upload_directory(
     }
 
 
-@mcp.tool()
+@tool
 def download_directory(
     remote_dir: str,
     local_dir: str | None = None,
@@ -2077,7 +2127,7 @@ def download_directory(
     }
 
 
-@mcp.tool()
+@tool
 def copy_between_clusters(
     source_path: str,
     dest_path: str,
@@ -2200,7 +2250,7 @@ def copy_between_clusters(
     }
 
 
-@mcp.tool()
+@tool
 def cluster_preflight(
     cluster: str | None = None,
     write_check: bool = False,
@@ -2387,7 +2437,7 @@ def cluster_preflight(
     return _preflight_response(target, write_check, checks)
 
 
-@mcp.tool()
+@tool
 def remote_git_status(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Return structured Git status for the project's remote repository."""
     current_settings = get_settings()
@@ -2408,7 +2458,7 @@ def remote_git_status(cluster: str | None = None, project: str | None = None) ->
     }
 
 
-@mcp.tool()
+@tool
 def remote_git_rev(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Return the current full and short Git commit for the project's remote repository."""
     current_settings = get_settings()
@@ -2436,7 +2486,7 @@ def remote_git_rev(cluster: str | None = None, project: str | None = None) -> di
     }
 
 
-@mcp.tool()
+@tool
 def remote_git_branch(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Return the current Git branch for the project's remote repository."""
     current_settings = get_settings()
@@ -2460,7 +2510,7 @@ def remote_git_branch(cluster: str | None = None, project: str | None = None) ->
 _GIT_LOG_FORMAT = "--format=%H%x1f%h%x1f%an%x1f%aI%x1f%s"
 
 
-@mcp.tool()
+@tool
 def remote_git_log(
     cluster: str | None = None,
     ref: str | None = None,
@@ -2486,7 +2536,7 @@ def remote_git_log(
     return {"cluster": target.name, "remote_repo": remote_repo, "count": len(commits), "commits": commits}
 
 
-@mcp.tool()
+@tool
 def remote_git_diff(
     cluster: str | None = None,
     base: str | None = None,
@@ -2527,7 +2577,7 @@ def remote_git_diff(
     }
 
 
-@mcp.tool()
+@tool
 def remote_git_pull(
     cluster: str | None = None,
     dry_run: bool = True,
@@ -2631,7 +2681,7 @@ def remote_git_pull(
     }
 
 
-@mcp.tool()
+@tool
 def remote_git_fetch(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Fetch (git fetch --prune) in the remote repository without touching the working tree."""
     current_settings = get_settings()
@@ -2649,7 +2699,7 @@ def remote_git_fetch(cluster: str | None = None, project: str | None = None) -> 
     }
 
 
-@mcp.tool()
+@tool
 def remote_git_checkout(ref: str, cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Check out a branch, tag, or commit in the remote repository (refuses if it has uncommitted changes)."""
     current_settings = get_settings()
@@ -2685,7 +2735,7 @@ def remote_git_checkout(ref: str, cluster: str | None = None, project: str | Non
     }
 
 
-@mcp.tool()
+@tool
 def remote_git_clone(
     url: str,
     cluster: str | None = None,
@@ -2737,7 +2787,7 @@ def remote_git_clone(
     }
 
 
-@mcp.tool()
+@tool
 def sync_local_commits(
     local_repo: str | None = None,
     branch: str | None = None,
@@ -2883,7 +2933,7 @@ def sync_local_commits(
     }
 
 
-@mcp.tool()
+@tool
 def setup_venv(
     cluster: str | None = None,
     name: str | None = None,
@@ -2938,7 +2988,7 @@ def setup_venv(
     }
 
 
-@mcp.tool()
+@tool
 def venv_info(cluster: str | None = None, name: str | None = None, project: str | None = None) -> dict[str, object]:
     """Show whether a virtualenv exists, its modules, installed packages, and how to activate it in a job."""
     current_settings = get_settings()
@@ -2959,7 +3009,7 @@ def venv_info(cluster: str | None = None, name: str | None = None, project: str 
     }
 
 
-@mcp.tool()
+@tool
 def check_wheels(packages: list[str], cluster: str | None = None, python_version: str | None = None) -> dict[str, object]:
     """Check which package versions the Alliance wheelhouse provides (avail_wheels)."""
     current_settings = get_settings()
@@ -2980,7 +3030,7 @@ def check_wheels(packages: list[str], cluster: str | None = None, python_version
     }
 
 
-@mcp.tool()
+@tool
 def hf_download(
     repo_id: str,
     cluster: str | None = None,
@@ -3023,7 +3073,7 @@ def hf_download(
     return {**task, "hf_home": hf_home, "repo_id": repo_id, "repo_type": repo_type}
 
 
-@mcp.tool()
+@tool
 def hf_cache_list(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """List models and datasets already cached in the cluster's shared HF_HOME."""
     current_settings = get_settings()
@@ -3043,7 +3093,7 @@ def hf_cache_list(cluster: str | None = None, project: str | None = None) -> dic
     }
 
 
-@mcp.tool()
+@tool
 def hf_store_token(cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Copy the HF_TOKEN environment variable of this MCP server to $HF_HOME/token on the cluster.
 
@@ -3069,7 +3119,7 @@ def hf_store_token(cluster: str | None = None, project: str | None = None) -> di
     return {"cluster": target.name, "host": target.host, "token_path": f"{hf_home}/token", "stored": True}
 
 
-@mcp.tool()
+@tool
 def job_script_template(
     cluster: str | None = None,
     profile: str | None = None,
@@ -3118,7 +3168,7 @@ def job_script_template(
     }
 
 
-@mcp.tool()
+@tool
 def remote_task_status(
     task_id: str,
     cluster: str | None = None,
@@ -3153,7 +3203,7 @@ def remote_task_status(
     }
 
 
-@mcp.tool()
+@tool
 def list_remote_tasks(cluster: str | None = None, limit: int = 20, project: str | None = None) -> dict[str, object]:
     """List background tasks started by this server on a cluster, newest first."""
     current_settings = get_settings()
@@ -3177,7 +3227,7 @@ def list_remote_tasks(cluster: str | None = None, limit: int = 20, project: str 
     return {"cluster": target.name, "host": target.host, "tasks": tasks[: validate_limit(limit)], **tracking}
 
 
-@mcp.tool()
+@tool
 def cancel_remote_task(task_id: str, cluster: str | None = None, project: str | None = None) -> dict[str, object]:
     """Stop a running background task (only works from the login node it runs on)."""
     current_settings = get_settings()
@@ -3233,7 +3283,7 @@ def _clip(text: str) -> tuple[str, bool]:
     return text[:_SHELL_OUTPUT_LIMIT] + "\n[... output truncated ...]\n", True
 
 
-@mcp.tool()
+@tool
 async def run_remote_command(
     command: str,
     reason: str,
@@ -3355,14 +3405,84 @@ async def run_remote_command(
     }
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Alliance Slurm MCP server")
     parser.add_argument(
         "--config",
         default=os.environ.get("ALLIANCE_SLURM_MCP_CONFIG", "config.yaml"),
         help="Path to YAML config file.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Run one shared server over HTTP on localhost instead of stdio, so every client "
+        "(Claude Code sessions, Codex) shares its SSH connections and needs Duo once per cluster.",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="Loopback address to listen on (default 127.0.0.1).")
+    parser.add_argument("--port", type=int, default=8765, help="Port for --serve (default 8765).")
+    parser.add_argument(
+        "--token-file",
+        default="~/.slurm-mcp/server-token",
+        help="Bearer token clients must send with --serve; created on first start.",
+    )
+    return parser.parse_args(argv)
+
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def load_or_create_token(path: Path) -> str:
+    """The shared server's bearer token, created on first use and readable only by this user."""
+    if path.is_file():
+        token = path.read_text(encoding="utf-8").strip()
+        if len(token) >= 32:
+            return token
+    path.parent.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_urlsafe(32)
+    path.write_text(token + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)  # on Windows the file inherits the user-profile ACL
+    except OSError:
+        pass
+    return token
+
+
+class TokenGuard:
+    """ASGI middleware: HTTP requests must carry `Authorization: Bearer <token>`."""
+
+    def __init__(self, app: Any, token: str) -> None:
+        self.app = app
+        self.expected = f"Bearer {token}".encode()
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            supplied = dict(scope.get("headers") or []).get(b"authorization", b"")
+            if not hmac.compare_digest(supplied, self.expected):
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"text/plain"), (b"www-authenticate", b"Bearer")]})
+                await send({"type": "http.response.body", "body": b"Missing or wrong bearer token.\n"})
+                return
+        await self.app(scope, receive, send)
+
+
+def http_app(token: str) -> Any:
+    """The streamable-HTTP MCP app behind the token check (endpoint /mcp)."""
+    return TokenGuard(mcp.streamable_http_app(), token)
+
+
+def serve_http(host: str, port: int, token_file: Path) -> None:
+    import uvicorn
+
+    if host not in _LOOPBACK_HOSTS:
+        raise SystemExit(f"--host must be a loopback address ({', '.join(sorted(_LOOPBACK_HOSTS))}); got {host}.")
+    token = load_or_create_token(token_file)
+    print(
+        f"alliance-slurm MCP serving on http://{host}:{port}/mcp (token in {token_file}). "
+        "Clients share its SSH connections.",
+        file=sys.stderr,
+        flush=True,
+    )
+    uvicorn.run(http_app(token), host=host, port=port, log_level="warning")
 
 
 config_path: Path | None = None
@@ -3370,7 +3490,7 @@ config_path: Path | None = None
 _CONNECTION_SETTINGS = ("ssh_backend", "ssh_command", "ssh_config", "known_hosts", "duo_option", "keepalive_seconds")
 
 
-@mcp.tool()
+@tool
 def config_reload() -> dict[str, object]:
     """Re-read config.yaml without restarting the server, keeping open SSH connections (no new 2FA).
 
@@ -3412,7 +3532,10 @@ def main() -> None:
     config_path = Path(args.config).resolve()
     settings = load_settings(config_path)
     backend = make_backend(settings)
-    mcp.run()
+    if args.serve:
+        serve_http(args.host, args.port, Path(args.token_file).expanduser())
+    else:
+        mcp.run()
 
 
 def _recorded_job_project(settings: Settings, cluster: str | None, job_id: str) -> str | None:
