@@ -32,8 +32,10 @@ The server has two ways to reuse your Duo-approved login (`ssh_backend` in
   phone, and later calls reuse that connection until the server stops. Keys
   are taken from ssh-agent or from `~/.ssh/id_*`. Encrypted keys must be
   loaded into the agent.
-- **openssh** (default on Linux, macOS and WSL). Reuses an OpenSSH
-  ControlMaster session that you start yourself:
+- **openssh** (default on Linux, macOS and WSL). Shares one OpenSSH
+  ControlMaster connection per cluster, so the MCP and your own `ssh narval`
+  sessions use the same Duo approval. It needs connection sharing in
+  `~/.ssh/config`:
 
   ```sshconfig
   Host narval
@@ -44,7 +46,12 @@ The server has two ways to reuse your Duo-approved login (`ssh_backend` in
     ControlPersist 8h
   ```
 
-  Then run `ssh -MNf narval`, approve Duo, and check it with `ssh -O check narval`.
+  Then Claude calls `cluster_login` and you approve the Duo push. That starts
+  `ssh -MNf narval` with an askpass helper that answers only the Duo prompt
+  (with `duo_option`, or the passcode you give), and refuses password,
+  key-passphrase and unknown-host-key prompts. Keys with a passphrase must be
+  in ssh-agent. You can also start it yourself with `ssh -MNf narval`, and
+  check it with `ssh -O check narval`.
 
 ## 2. Install and configure
 
@@ -366,9 +373,10 @@ loginctl enable-linger "$USER"          # optional: keep it running after you lo
 
 On a Linux workstation:
 
-- **Set `ssh_backend: paramiko` in that machine's config.** The default there
-  is `openssh`, which can't answer Duo, so `cluster_login` couldn't send the
-  push.
+- **Either backend works.** The default there is `openssh`, which needs
+  `ControlMaster`/`ControlPath` in `~/.ssh/config` (see above) and shares the
+  connection with your terminal. `ssh_backend: paramiko` needs no SSH config
+  changes but keeps the connection inside the server.
 - **Give it its own config.** It needs Linux paths for `local_roots`, and
   `ssh <cluster>` once per cluster to record host keys.
 - **Keep the machines' records in sync** with `project_record_sync`. The

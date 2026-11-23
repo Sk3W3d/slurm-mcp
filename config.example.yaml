@@ -3,8 +3,9 @@ default_cluster: killarney
 
 # How the server reaches the clusters:
 #   auto     - paramiko on Windows, openssh elsewhere (default)
-#   openssh  - reuse a 2FA-backed ControlMaster session you start with `ssh -MNf <host>`
-#              (Linux, macOS, WSL). Set ssh_command to ["wsl", "ssh"] if the master lives in WSL.
+#   openssh  - share an OpenSSH ControlMaster per cluster (Linux, macOS, WSL). cluster_login
+#              starts it and answers Duo; ~/.ssh/config needs ControlMaster/ControlPath.
+#              Set ssh_command to ["wsl", "ssh"] if the master lives in WSL.
 #   paramiko - the server holds the connection itself; call the cluster_login tool and
 #              approve the Duo push on your phone. Works on native Windows.
 ssh_backend: auto

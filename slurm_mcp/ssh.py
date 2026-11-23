@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -61,14 +63,47 @@ def argv_in_dir(cwd: str, argv: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+# OpenSSH asks keyboard-interactive (Duo) questions on a TTY, which the MCP
+# server has none of. SSH_ASKPASS_REQUIRE=force (OpenSSH 8.4+) sends them to
+# this helper instead. It answers only the Duo prompt ("Passcode or option
+# (1-N):") and refuses everything else, so it can never type the answer into a
+# password, key passphrase, or unknown-host-key prompt.
+_DUO_ASKPASS_SCRIPT = """#!/bin/sh
+prompt=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+case "$prompt" in
+  *password*|*passphrase*|*yes/no*|*fingerprint*)
+    echo "slurm-mcp: refusing SSH prompt: $1" >&2; exit 1 ;;
+  *passcode*|*option*)
+    printf '%s\\n' "$SLURM_MCP_DUO_ANSWER" ;;
+  *)
+    echo "slurm-mcp: refusing SSH prompt: $1" >&2; exit 1 ;;
+esac
+"""
+
+_CONTROL_CONFIG_HINT = (
+    "Add to ~/.ssh/config for this host:\n"
+    "    ControlMaster auto\n"
+    "    ControlPath ~/.ssh/cm-%C\n"
+    "    ControlPersist 8h"
+)
+
+
 class OpenSSHBackend:
     name = "openssh"
 
-    def __init__(self, ssh_command: tuple[str, ...] = ("ssh",)) -> None:
+    def __init__(self, ssh_command: tuple[str, ...] = ("ssh",), duo_option: str = "1") -> None:
         self.ssh_command = ssh_command
+        self.duo_option = duo_option
 
     def check(self, host: str) -> CommandResult:
-        return check_master(self.ssh_command, host)
+        result = check_master(self.ssh_command, host)
+        if result.returncode != 0 and "No ControlPath specified" in result.stderr:
+            return CommandResult(
+                result.returncode,
+                result.stdout,
+                f"No ControlPath is configured for {host}, so no connection can be shared. {_CONTROL_CONFIG_HINT}",
+            )
+        return result
 
     def run(
         self,
@@ -94,15 +129,54 @@ class OpenSSHBackend:
         duo_option: str | None = None,
         timeout: int = 120,
     ) -> dict[str, Any]:
-        result = self.check(host)
-        return {
-            "connected": result.returncode == 0,
-            "message": (result.stderr or result.stdout).strip(),
-            "instructions": (
-                "The openssh backend cannot answer 2FA prompts. Start a master connection "
-                f"manually in a terminal with: ssh -MNf {host}"
-            ),
-        }
+        """Start a ControlMaster for host, answering Duo through an askpass helper.
+
+        Raises RuntimeError when the connection cannot be made, so callers
+        record the attempt as failed.
+        """
+        if self.check(host).returncode == 0:
+            return {"connected": True, "reused": True, "message": "Master connection already running."}
+        if not _has_control_path(self.ssh_command, host):
+            raise RuntimeError(f"No ControlPath is configured for {host}, so the login could not be shared. {_CONTROL_CONFIG_HINT}")
+
+        answer = passcode or duo_option or self.duo_option
+        with tempfile.TemporaryDirectory(prefix="slurm-mcp-askpass-") as tmp:
+            helper = Path(tmp) / "duo-askpass.sh"
+            helper.write_text(_DUO_ASKPASS_SCRIPT, encoding="utf-8")
+            helper.chmod(0o700)
+            env = {
+                **os.environ,
+                "SSH_ASKPASS": str(helper),
+                "SSH_ASKPASS_REQUIRE": "force",
+                "SLURM_MCP_DUO_ANSWER": answer,
+            }
+            # OpenSSH before 8.4 ignores SSH_ASKPASS_REQUIRE and uses askpass only with DISPLAY set.
+            env.setdefault("DISPLAY", ":0")
+            # -f backgrounds the master after authentication. Its output goes to a file rather
+            # than a pipe, so a master that kept the pipe open could not make this call hang.
+            log_path = Path(tmp) / "ssh.log"
+            with log_path.open("wb") as log:
+                try:
+                    completed = subprocess.run(
+                        [*self.ssh_command, "-MNf", "-o", "ControlMaster=yes", "-o", "ConnectTimeout=20", host],
+                        stdin=subprocess.DEVNULL,
+                        stdout=log,
+                        stderr=log,
+                        env=env,
+                        timeout=timeout,
+                        check=False,
+                    )
+                    returncode: int | None = completed.returncode
+                except subprocess.TimeoutExpired:
+                    returncode = None
+            output = log_path.read_text(encoding="utf-8", errors="replace")
+
+        if returncode is None:
+            raise RuntimeError(f"The Duo prompt was not approved within {timeout} seconds.")
+        if returncode != 0 or self.check(host).returncode != 0:
+            raise RuntimeError(f"SSH login to {host} failed: {_login_failure_detail(output)}")
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        return {"connected": True, "message": lines[-1] if lines else "Master connection started."}
 
     def logout(self, host: str) -> dict[str, Any]:
         result = _run_local([*self.ssh_command, "-O", "exit", host], timeout=15)
@@ -133,6 +207,29 @@ class OpenSSHBackend:
 
 def check_master(ssh_command: tuple[str, ...], host: str, timeout: int = 10) -> CommandResult:
     return _run_local([*ssh_command, "-O", "check", host], timeout=timeout)
+
+
+def _has_control_path(ssh_command: tuple[str, ...], host: str) -> bool:
+    """Whether ssh's resolved config for host names a ControlPath to share."""
+    result = _run_local([*ssh_command, "-G", host], timeout=10)
+    for line in result.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        if key.lower() == "controlpath":
+            return value.strip().lower() not in ("", "none")
+    return False
+
+
+def _login_failure_detail(output: str) -> str:
+    """The useful part of a failed ssh login's output, skipping cluster banners."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    refused = [line for line in lines if line.startswith("slurm-mcp: refusing")]
+    if refused:
+        return refused[0] + " (only the Duo prompt is answered automatically)"
+    useful = [
+        line for line in lines
+        if any(word in line.lower() for word in ("denied", "fail", "error", "refused", "timed out", "could not", "closed"))
+    ]
+    return "; ".join(useful[-3:]) or (lines[-1] if lines else "no output from ssh")
 
 
 def remote_command_result(

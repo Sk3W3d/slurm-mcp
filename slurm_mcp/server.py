@@ -270,7 +270,7 @@ def get_backend() -> SSHBackend:
 
 def make_backend(current_settings: Settings) -> SSHBackend:
     if current_settings.resolved_ssh_backend() == "openssh":
-        return OpenSSHBackend(current_settings.ssh_command)
+        return OpenSSHBackend(current_settings.ssh_command, duo_option=current_settings.duo_option)
     from .ssh_paramiko import ParamikoBackend
 
     return ParamikoBackend(
@@ -1046,7 +1046,7 @@ async def cluster_login(
             }
         raise
     if not result.get("reused"):
-        _record_connection(target, "login", True, time.time() - start)
+        _record_connection(target, "login", bool(result.get("connected")), time.time() - start)
     _write_remote_audit(current_settings, {**event, "connected": result.get("connected")})
     return {"cluster": target.name, "host": target.host, "backend": get_backend().name, "via": "login", **result}
 
