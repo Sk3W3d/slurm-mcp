@@ -356,6 +356,24 @@ bearer_token_env_var = "SLURM_MCP_TOKEN"
 tool_timeout_sec = 900   # cluster_login waits up to 2 minutes for Duo
 ```
 
+On **Linux or macOS**, use the shell versions:
+
+```bash
+scripts/shared-server.sh start          # also: stop | status | restart; --port N --config PATH
+scripts/install-systemd-user.sh         # optional, Linux: systemd user service (--uninstall to remove)
+loginctl enable-linger "$USER"          # optional: keep it running after you log out
+```
+
+On a Linux workstation:
+
+- **Set `ssh_backend: paramiko` in that machine's config.** The default there
+  is `openssh`, which can't answer Duo, so `cluster_login` couldn't send the
+  push.
+- **Give it its own config.** It needs Linux paths for `local_roots`, and
+  `ssh <cluster>` once per cluster to record host keys.
+- **Keep the machines' records in sync** with `project_record_sync`. The
+  project record is per machine.
+
 **When Duo happens.** Once per cluster, the first time any client needs it.
 After that, every session and agent reuses the connection, and `/mcp` in
 Claude Code only reconnects the client, without a new push. A new push is
